@@ -1578,6 +1578,11 @@ export class DevToolsBridge extends EventEmitter {
    * Get renderer ID for an element (Phase 2.3: Multi-renderer support)
    */
   private getRendererIDForElement(id: number): number | null {
+    // Element must exist in our element map
+    if (!this.elements.has(id)) {
+      return null;
+    }
+
     // Check element-to-renderer mapping first
     const rendererID = this.elementToRenderer.get(id);
     if (rendererID !== undefined) {
@@ -1591,7 +1596,7 @@ export class DevToolsBridge extends EventEmitter {
       }
     }
 
-    // Default fallback: use first renderer or 1
+    // Element exists but renderer not found - use first renderer or 1
     if (this.renderers.size === 0) {
       return 1;
     }
