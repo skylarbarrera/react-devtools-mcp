@@ -27,6 +27,10 @@ import type {
   ProfilingData,
   ComponentFilter,
   OverrideTarget,
+  ProtocolCapabilities,
+  Renderer,
+  RendererInterface,
+  SourceLocation,
 } from './types.js';
 import { noopLogger, type Logger } from './logger.js';
 import { ConnectionError, TimeoutError } from './errors.js';
@@ -90,11 +94,19 @@ interface PendingRequest {
   operation: string;
 }
 
-interface RendererInfo {
-  id: number;
-  version: string;
-  packageName?: string;
-}
+// Default protocol capabilities (Phase 2.2)
+const DEFAULT_CAPABILITIES: ProtocolCapabilities = {
+  bridgeProtocolVersion: 2,
+  backendVersion: null,
+  supportsInspectElementPaths: false,
+  supportsProfilingChangeDescriptions: false,
+  supportsTimeline: false,
+  supportsNativeStyleEditor: false,
+  supportsErrorBoundaryTesting: false,
+  supportsTraceUpdates: false,
+  isBackendStorageAPISupported: false,
+  isSynchronousXHRSupported: false,
+};
 
 export interface BridgeOptions extends Partial<ConnectionConfig> {
   logger?: Logger;
@@ -122,7 +134,8 @@ export class DevToolsBridge extends EventEmitter {
   // Component tree state
   private elements: Map<number, Element> = new Map();
   private rootIDs: Set<number> = new Set();
-  private renderers: Map<number, RendererInfo> = new Map();
+  private renderers: Map<number, Renderer> = new Map();
+  private elementToRenderer: Map<number, number> = new Map(); // Phase 2.3: Element-to-renderer mapping
 
   // Request tracking (Phase 1.5 & 1.6: Memory leak fix + ID correlation)
   private pendingRequests: Map<string, PendingRequest> = new Map();
@@ -137,9 +150,14 @@ export class DevToolsBridge extends EventEmitter {
   private isProfiling = false;
   private profilingData: ProfilingData | null = null;
 
-  // Protocol info
+  // Protocol info (Phase 2.2)
   private backendVersion: string | null = null;
+  private capabilities: ProtocolCapabilities = { ...DEFAULT_CAPABILITIES };
+  private capabilitiesNegotiated = false;
   private lastMessageAt = 0;
+
+  // Native inspection state (Phase 2.1)
+  private isInspectingNative = false;
 
   constructor(options: BridgeOptions = {}) {
     super();
@@ -257,7 +275,22 @@ export class DevToolsBridge extends EventEmitter {
     // Send initial handshake
     this.send('bridge', { version: 2 });
 
+    // Request protocol capabilities (Phase 2.2)
+    this.negotiateCapabilities();
+
     this.emit('connected');
+  }
+
+  /**
+   * Negotiate protocol capabilities with backend (Phase 2.2)
+   */
+  private negotiateCapabilities(): void {
+    this.logger.debug('Negotiating protocol capabilities');
+
+    // Request capability detection from backend
+    this.send('isBackendStorageAPISupported', {});
+    this.send('isSynchronousXHRSupported', {});
+    this.send('getSupportedRendererInterfaces', {});
   }
 
   /**
@@ -367,10 +400,14 @@ export class DevToolsBridge extends EventEmitter {
     this.elements.clear();
     this.rootIDs.clear();
     this.renderers.clear();
+    this.elementToRenderer.clear();
     this.elementErrors.clear();
     this.elementWarnings.clear();
     this.isProfiling = false;
     this.profilingData = null;
+    this.isInspectingNative = false;
+    this.capabilities = { ...DEFAULT_CAPABILITIES };
+    this.capabilitiesNegotiated = false;
     this.stopStaleRequestCleanup();
   }
 
@@ -548,6 +585,55 @@ export class DevToolsBridge extends EventEmitter {
         this.resolvePending('nativeStyle', payload);
         break;
 
+      // ═══════════════════════════════════════════════════════════════════════
+      // Phase 2.1: Additional Message Handlers
+      // ═══════════════════════════════════════════════════════════════════════
+
+      case 'isBackendStorageAPISupported':
+        this.handleStorageSupport(payload as { isSupported: boolean });
+        break;
+
+      case 'isSynchronousXHRSupported':
+        this.handleXHRSupport(payload as { isSupported: boolean });
+        break;
+
+      case 'getSupportedRendererInterfaces':
+        this.handleRendererInterfaces(payload as { rendererInterfaces: RendererInterface[] });
+        break;
+
+      case 'updateComponentFilters':
+        this.logger.debug('Component filters updated');
+        this.emit('filtersUpdated');
+        break;
+
+      case 'savedToClipboard':
+        this.logger.debug('Content saved to clipboard');
+        this.resolvePending('clipboard', { success: true });
+        break;
+
+      case 'viewAttributeSourceResult':
+        this.handleAttributeSourceResult(payload as { source: SourceLocation | null });
+        break;
+
+      case 'overrideContextResult':
+        this.resolvePending('overrideContext', payload);
+        break;
+
+      case 'inspectingNativeStarted':
+        this.isInspectingNative = true;
+        this.logger.info('Native inspection started');
+        this.emit('inspectingNativeStarted');
+        break;
+
+      case 'inspectingNativeStopped':
+        this.isInspectingNative = false;
+        this.handleInspectingNativeStopped(payload as { elementID: number | null });
+        break;
+
+      case 'captureScreenshotResult':
+        this.resolvePending('screenshot', payload);
+        break;
+
       default:
         this.logger.debug('Unknown message type', { event });
         this.emit('unknown', { event, payload });
@@ -555,13 +641,80 @@ export class DevToolsBridge extends EventEmitter {
   }
 
   private handleRenderer(payload: { id: number; rendererPackageName: string; rendererVersion: string }): void {
-    this.renderers.set(payload.id, {
+    // Phase 2.3: Enhanced renderer tracking
+    const renderer: Renderer = {
       id: payload.id,
       version: payload.rendererVersion,
       packageName: payload.rendererPackageName,
-    });
+      rootIDs: new Set(),
+      elementIDs: new Set(),
+    };
+    this.renderers.set(payload.id, renderer);
     this.logger.info('Renderer connected', { id: payload.id, version: payload.rendererVersion });
-    this.emit('renderer', payload);
+    this.emit('renderer', { id: payload.id, rendererVersion: payload.rendererVersion });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Phase 2.1: Capability Detection Handlers
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private handleStorageSupport(payload: { isSupported: boolean }): void {
+    this.capabilities.isBackendStorageAPISupported = payload.isSupported;
+    this.logger.debug('Storage API support', { isSupported: payload.isSupported });
+    this.checkCapabilitiesComplete();
+  }
+
+  private handleXHRSupport(payload: { isSupported: boolean }): void {
+    this.capabilities.isSynchronousXHRSupported = payload.isSupported;
+    this.logger.debug('Synchronous XHR support', { isSupported: payload.isSupported });
+    this.checkCapabilitiesComplete();
+  }
+
+  private handleRendererInterfaces(payload: { rendererInterfaces: RendererInterface[] }): void {
+    this.logger.debug('Renderer interfaces received', { count: payload.rendererInterfaces?.length ?? 0 });
+
+    if (payload.rendererInterfaces) {
+      for (const iface of payload.rendererInterfaces) {
+        // Update renderer with interface info
+        const renderer = this.renderers.get(iface.id);
+        if (renderer) {
+          renderer.version = iface.version;
+          renderer.packageName = iface.renderer;
+        }
+
+        // Infer capabilities from renderer version
+        const versionNum = parseFloat(iface.version);
+        if (versionNum >= 18) {
+          this.capabilities.supportsProfilingChangeDescriptions = true;
+          this.capabilities.supportsTimeline = true;
+          this.capabilities.supportsErrorBoundaryTesting = true;
+        }
+      }
+    }
+
+    this.checkCapabilitiesComplete();
+  }
+
+  private checkCapabilitiesComplete(): void {
+    // Mark as negotiated once we have basic capability info
+    if (!this.capabilitiesNegotiated) {
+      this.capabilitiesNegotiated = true;
+      this.logger.info('Protocol capabilities negotiated', { capabilities: this.capabilities });
+      this.emit('capabilitiesNegotiated', this.capabilities);
+    }
+  }
+
+  private handleAttributeSourceResult(payload: { source: SourceLocation | null }): void {
+    this.resolvePending('attributeSource', payload.source);
+    if (payload.source) {
+      this.emit('attributeSource', payload.source);
+    }
+  }
+
+  private handleInspectingNativeStopped(payload: { elementID: number | null }): void {
+    this.logger.info('Native inspection stopped', { elementID: payload.elementID });
+    this.resolvePending('inspectNative', payload.elementID);
+    this.emit('inspectingNativeStopped', payload.elementID);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -631,9 +784,9 @@ export class DevToolsBridge extends EventEmitter {
   }
 
   /**
-   * Process ADD operation with bounds checking (Phase 1.4)
+   * Process ADD operation with bounds checking (Phase 1.4) and renderer tracking (Phase 2.3)
    */
-  private processAddOperation(ops: number[], i: number, _rendererID: number): number {
+  private processAddOperation(ops: number[], i: number, rendererID: number): number {
     // Minimum fields: id, type, parentID, ownerID, displayNameLen
     const minRequired = 5;
     if (i + minRequired > ops.length) {
@@ -731,9 +884,22 @@ export class DevToolsBridge extends EventEmitter {
     // Track root
     if (element.type === 'root') {
       this.rootIDs.add(id);
+      // Phase 2.3: Track root in renderer
+      const renderer = this.renderers.get(rendererID);
+      if (renderer) {
+        renderer.rootIDs.add(id);
+      }
     }
 
     this.elements.set(id, element);
+
+    // Phase 2.3: Track element-to-renderer mapping
+    this.elementToRenderer.set(id, rendererID);
+    const renderer = this.renderers.get(rendererID);
+    if (renderer) {
+      renderer.elementIDs.add(id);
+    }
+
     this.emit('elementAdded', element);
 
     return i;
@@ -765,6 +931,17 @@ export class DevToolsBridge extends EventEmitter {
       const element = this.elements.get(id);
 
       if (element) {
+        // Phase 2.3: Clean up renderer tracking
+        const rendererID = this.elementToRenderer.get(id);
+        if (rendererID !== undefined) {
+          const renderer = this.renderers.get(rendererID);
+          if (renderer) {
+            renderer.elementIDs.delete(id);
+            renderer.rootIDs.delete(id);
+          }
+          this.elementToRenderer.delete(id);
+        }
+
         this.elements.delete(id);
         this.rootIDs.delete(id);
         this.elementErrors.delete(id);
@@ -1199,6 +1376,195 @@ export class DevToolsBridge extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.1: ADDITIONAL PUBLIC API
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Save content to clipboard
+   */
+  async saveToClipboard(value: string): Promise<{ success: boolean }> {
+    this.ensureConnected();
+    const promise = this.createPending('clipboard', 'saveToClipboard');
+    this.send('saveToClipboard', { value });
+
+    // Timeout fallback - clipboard save doesn't always respond
+    return Promise.race([
+      promise as Promise<{ success: boolean }>,
+      new Promise<{ success: boolean }>((resolve) =>
+        setTimeout(() => resolve({ success: true }), 500)
+      ),
+    ]);
+  }
+
+  /**
+   * View attribute source location
+   */
+  async viewAttributeSource(id: number, path: Array<string | number>): Promise<SourceLocation | null> {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return null;
+
+    const promise = this.createPending('attributeSource', `viewAttributeSource(${id})`);
+    this.send('viewAttributeSource', { id, rendererID, path });
+    return promise as Promise<SourceLocation | null>;
+  }
+
+  /**
+   * Override context value
+   */
+  async overrideContext(id: number, path: Array<string | number>, value: unknown): Promise<boolean> {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return false;
+
+    const promise = this.createPending('overrideContext', `overrideContext(${id})`);
+    this.send('overrideContext', { id, rendererID, path, value });
+
+    try {
+      const result = await promise as { success: boolean };
+      return result.success;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Start native element inspection mode
+   */
+  startInspectingNative(): void {
+    this.ensureConnected();
+    this.send('startInspectingNative', {});
+  }
+
+  /**
+   * Stop native element inspection mode
+   * @param selectNextElement - Whether to select the next element under pointer
+   * @returns The ID of the selected element, or null
+   */
+  async stopInspectingNative(selectNextElement = true): Promise<number | null> {
+    this.ensureConnected();
+    const promise = this.createPending('inspectNative', 'stopInspectingNative');
+    this.send('stopInspectingNative', { selectNextElement });
+    return promise as Promise<number | null>;
+  }
+
+  /**
+   * Check if currently in native inspection mode
+   */
+  isInspectingNativeMode(): boolean {
+    return this.isInspectingNative;
+  }
+
+  /**
+   * Capture screenshot of an element
+   */
+  async captureScreenshot(id: number): Promise<string | null> {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return null;
+
+    const promise = this.createPending('screenshot', `captureScreenshot(${id})`);
+    this.send('captureScreenshot', { id, rendererID });
+
+    try {
+      const result = await promise as { screenshot: string | null };
+      return result.screenshot;
+    } catch {
+      return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.2: CAPABILITIES API
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get negotiated protocol capabilities
+   */
+  getCapabilities(): ProtocolCapabilities {
+    return { ...this.capabilities };
+  }
+
+  /**
+   * Check if capabilities have been negotiated
+   */
+  hasNegotiatedCapabilities(): boolean {
+    return this.capabilitiesNegotiated;
+  }
+
+  /**
+   * Wait for capabilities negotiation to complete
+   */
+  async waitForCapabilities(timeout = 5000): Promise<ProtocolCapabilities> {
+    if (this.capabilitiesNegotiated) {
+      return this.getCapabilities();
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.removeListener('capabilitiesNegotiated', handler);
+        reject(new TimeoutError('waitForCapabilities', timeout));
+      }, timeout);
+
+      const handler = (capabilities: ProtocolCapabilities) => {
+        clearTimeout(timer);
+        resolve(capabilities);
+      };
+
+      this.once('capabilitiesNegotiated', handler);
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.3: RENDERER MANAGEMENT API
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get all connected renderers
+   */
+  getRenderers(): Renderer[] {
+    return Array.from(this.renderers.values()).map((r) => ({
+      ...r,
+      rootIDs: new Set(r.rootIDs),
+      elementIDs: new Set(r.elementIDs),
+    }));
+  }
+
+  /**
+   * Get renderer by ID
+   */
+  getRenderer(id: number): Renderer | null {
+    const renderer = this.renderers.get(id);
+    if (!renderer) return null;
+    return {
+      ...renderer,
+      rootIDs: new Set(renderer.rootIDs),
+      elementIDs: new Set(renderer.elementIDs),
+    };
+  }
+
+  /**
+   * Get renderer for a specific element
+   */
+  getRendererForElement(elementID: number): Renderer | null {
+    const rendererID = this.getRendererIDForElement(elementID);
+    if (rendererID === null) return null;
+    return this.getRenderer(rendererID);
+  }
+
+  /**
+   * Get elements for a specific renderer
+   */
+  getElementsByRenderer(rendererID: number): Element[] {
+    const renderer = this.renderers.get(rendererID);
+    if (!renderer) return [];
+
+    return Array.from(renderer.elementIDs)
+      .map((id) => this.elements.get(id))
+      .filter((el): el is Element => el !== undefined);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1208,11 +1574,26 @@ export class DevToolsBridge extends EventEmitter {
     }
   }
 
-  private getRendererIDForElement(_id: number): number | null {
-    // For now, assume single renderer with ID 1
-    // TODO: Track which renderer owns each element for multi-renderer support
+  /**
+   * Get renderer ID for an element (Phase 2.3: Multi-renderer support)
+   */
+  private getRendererIDForElement(id: number): number | null {
+    // Check element-to-renderer mapping first
+    const rendererID = this.elementToRenderer.get(id);
+    if (rendererID !== undefined) {
+      return rendererID;
+    }
+
+    // Fall back to finding renderer by searching all renderers' element sets
+    for (const renderer of this.renderers.values()) {
+      if (renderer.elementIDs.has(id) || renderer.rootIDs.has(id)) {
+        return renderer.id;
+      }
+    }
+
+    // Default fallback: use first renderer or 1
     if (this.renderers.size === 0) {
-      return 1; // Default fallback
+      return 1;
     }
     return this.renderers.keys().next().value ?? 1;
   }

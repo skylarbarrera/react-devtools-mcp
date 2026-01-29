@@ -448,6 +448,102 @@ const TOOLS: Tool[] = [
     description: 'Get server and connection health status',
     inputSchema: { type: 'object', properties: {} },
   },
+
+  // Phase 2: Protocol & Renderer Management
+  {
+    name: 'get_capabilities',
+    description: 'Get negotiated protocol capabilities (features supported by backend)',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_renderers',
+    description: 'Get all connected React renderers (for multi-renderer apps)',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_renderer',
+    description: 'Get a specific renderer by ID',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Renderer ID' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'get_elements_by_renderer',
+    description: 'Get all elements for a specific renderer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        rendererID: { type: 'number', description: 'Renderer ID' },
+      },
+      required: ['rendererID'],
+    },
+  },
+
+  // Phase 2: Native Inspection
+  {
+    name: 'start_inspecting_native',
+    description: 'Start native element inspection mode (tap-to-select)',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'stop_inspecting_native',
+    description: 'Stop native element inspection mode',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selectNextElement: { type: 'boolean', description: 'Select element under pointer (default: true)' },
+      },
+    },
+  },
+  {
+    name: 'get_inspecting_native_status',
+    description: 'Check if native inspection mode is active',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // Phase 2: Additional Features
+  {
+    name: 'capture_screenshot',
+    description: 'Capture screenshot of an element (if supported)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Element ID' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'save_to_clipboard',
+    description: 'Save content to system clipboard',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        value: { type: 'string', description: 'Content to save' },
+      },
+      required: ['value'],
+    },
+  },
+  {
+    name: 'view_attribute_source',
+    description: 'Get source location for a specific attribute path',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Element ID' },
+        path: {
+          type: 'array',
+          items: { oneOf: [{ type: 'string' }, { type: 'number' }] },
+          description: 'Path to attribute',
+        },
+      },
+      required: ['id', 'path'],
+    },
+  },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -877,6 +973,82 @@ async function handleToolCall(
         pendingRequests,
         uptime: process.uptime(),
       };
+    }
+
+    // Phase 2: Protocol & Renderer Management
+    case 'get_capabilities': {
+      const capabilities = bridge.getCapabilities();
+      const negotiated = bridge.hasNegotiatedCapabilities();
+      return { capabilities, negotiated };
+    }
+
+    case 'get_renderers': {
+      const renderers = bridge.getRenderers();
+      return {
+        renderers: renderers.map((r) => ({
+          id: r.id,
+          version: r.version,
+          packageName: r.packageName,
+          rootCount: r.rootIDs.size,
+          elementCount: r.elementIDs.size,
+        })),
+      };
+    }
+
+    case 'get_renderer': {
+      const renderer = bridge.getRenderer(args.id as number);
+      if (!renderer) {
+        return { renderer: null };
+      }
+      return {
+        renderer: {
+          id: renderer.id,
+          version: renderer.version,
+          packageName: renderer.packageName,
+          rootIDs: Array.from(renderer.rootIDs),
+          elementCount: renderer.elementIDs.size,
+        },
+      };
+    }
+
+    case 'get_elements_by_renderer': {
+      const elements = bridge.getElementsByRenderer(args.rendererID as number);
+      return { elements, count: elements.length };
+    }
+
+    // Phase 2: Native Inspection
+    case 'start_inspecting_native': {
+      bridge.startInspectingNative();
+      return { success: true, isInspecting: true };
+    }
+
+    case 'stop_inspecting_native': {
+      const selectNextElement = args.selectNextElement !== false;
+      const elementID = await bridge.stopInspectingNative(selectNextElement);
+      return { success: true, selectedElementID: elementID };
+    }
+
+    case 'get_inspecting_native_status': {
+      return { isInspecting: bridge.isInspectingNativeMode() };
+    }
+
+    // Phase 2: Additional Features
+    case 'capture_screenshot': {
+      const screenshot = await bridge.captureScreenshot(args.id as number);
+      return { success: screenshot !== null, screenshot };
+    }
+
+    case 'save_to_clipboard': {
+      const clipResult = await bridge.saveToClipboard(args.value as string);
+      return clipResult;
+    }
+
+    case 'view_attribute_source': {
+      const source = await bridge.viewAttributeSource(
+        args.id as number,
+        args.path as Array<string | number>
+      );
+      return { source };
     }
 
     default:

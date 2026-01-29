@@ -16,6 +16,39 @@ export interface ConnectionConfig {
   autoReconnect: boolean;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PROTOCOL CAPABILITIES (Phase 2.2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface ProtocolCapabilities {
+  bridgeProtocolVersion: number;
+  backendVersion: string | null;
+
+  // Feature support
+  supportsInspectElementPaths: boolean;
+  supportsProfilingChangeDescriptions: boolean;
+  supportsTimeline: boolean;
+  supportsNativeStyleEditor: boolean;
+  supportsErrorBoundaryTesting: boolean;
+  supportsTraceUpdates: boolean;
+
+  // Storage/XHR detection
+  isBackendStorageAPISupported: boolean;
+  isSynchronousXHRSupported: boolean;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RENDERER (Phase 2.3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface Renderer {
+  id: number;
+  version: string;
+  packageName: string;
+  rootIDs: Set<number>;
+  elementIDs: Set<number>;
+}
+
 export type ConnectionState =
   | 'disconnected'
   | 'connecting'
@@ -328,7 +361,17 @@ export type BridgeOutgoing =
   | { type: 'clearErrorsForElementID'; id: number }
   | { type: 'clearWarningsForElementID'; id: number }
   | { type: 'NativeStyleEditor_measure'; id: number }
-  | { type: 'NativeStyleEditor_setValue'; id: number; property: string; value: unknown };
+  | { type: 'NativeStyleEditor_setValue'; id: number; property: string; value: unknown }
+  // Phase 2.1: Additional outgoing messages
+  | { type: 'isBackendStorageAPISupported' }
+  | { type: 'isSynchronousXHRSupported' }
+  | { type: 'getSupportedRendererInterfaces' }
+  | { type: 'saveToClipboard'; value: string }
+  | { type: 'viewAttributeSource'; id: number; rendererID: number; path: Array<string | number> }
+  | { type: 'overrideContext'; id: number; rendererID: number; path: Array<string | number>; value: unknown }
+  | { type: 'startInspectingNative' }
+  | { type: 'stopInspectingNative'; selectNextElement: boolean }
+  | { type: 'captureScreenshot'; id: number; rendererID: number };
 
 export type OverrideTarget = 'props' | 'state' | 'hooks' | 'context';
 
@@ -340,7 +383,28 @@ export type BridgeIncoming =
   | { type: 'profilingStatus'; isProfiling: boolean }
   | { type: 'backendVersion'; version: string }
   | { type: 'bridgeProtocol'; version: number }
-  | { type: 'NativeStyleEditor_styleAndLayout'; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } };
+  | { type: 'NativeStyleEditor_styleAndLayout'; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } }
+  // Phase 2.1: Additional message types
+  | { type: 'isBackendStorageAPISupported'; isSupported: boolean }
+  | { type: 'isSynchronousXHRSupported'; isSupported: boolean }
+  | { type: 'getSupportedRendererInterfaces'; rendererInterfaces: RendererInterface[] }
+  | { type: 'updateComponentFilters' }
+  | { type: 'savedToClipboard' }
+  | { type: 'viewAttributeSourceResult'; source: SourceLocation | null }
+  | { type: 'overrideContextResult'; success: boolean }
+  | { type: 'inspectingNativeStarted' }
+  | { type: 'inspectingNativeStopped'; elementID: number | null }
+  | { type: 'captureScreenshotResult'; screenshot: string | null };
+
+// Renderer interface capabilities
+export interface RendererInterface {
+  id: number;
+  renderer: string;
+  version: string;
+  bundleType: 'development' | 'production';
+  hasOwnerMetadata: boolean;
+  hasManyWarnings: boolean;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MCP TOOL PARAMS & RESULTS
