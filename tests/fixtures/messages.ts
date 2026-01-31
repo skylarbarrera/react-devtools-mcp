@@ -50,15 +50,16 @@ export const OPERATIONS_NESTED = {
   payload: NESTED_TREE,
 };
 
-export function createInspectedElementPayload(id: number): {
+export function createInspectedElementPayload(id: number, responseID?: number): {
   event: string;
-  payload: { type: 'full-data'; element: InspectedElement; requestID?: number };
+  payload: { type: 'full-data'; id: number; element: InspectedElement; responseID?: number; requestID?: number };
 } {
   return {
     event: 'inspectedElement',
     payload: {
       type: 'full-data',
-      requestID: id,
+      id,
+      responseID: responseID ?? id,
       element: {
         id,
         displayName: `Component${id}`,
@@ -95,11 +96,12 @@ export function createInspectedElementPayload(id: number): {
 
 export function createOwnersListPayload(
   id: number,
-  owners: SerializedElement[]
-): { event: string; payload: { id: number; requestID?: number; owners: SerializedElement[] } } {
+  owners: SerializedElement[],
+  responseID?: number
+): { event: string; payload: { id: number; responseID?: number; requestID?: number; owners: SerializedElement[] } } {
   return {
     event: 'ownersList',
-    payload: { id, requestID: id, owners },
+    payload: { id, responseID: responseID ?? id, owners },
   };
 }
 
@@ -135,13 +137,23 @@ export const PROFILING_DATA = {
   },
 };
 
-export const NATIVE_STYLE = {
-  event: 'NativeStyleEditor_styleAndLayout',
-  payload: {
-    style: { backgroundColor: '#ffffff', padding: 16 },
-    layout: { x: 0, y: 0, width: 375, height: 100 },
-  },
-};
+export function createNativeStylePayload(id: number, responseID?: number): {
+  event: string;
+  payload: { id: number; responseID?: number; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } };
+} {
+  return {
+    event: 'NativeStyleEditor_styleAndLayout',
+    payload: {
+      id,
+      responseID,
+      style: { backgroundColor: '#ffffff', padding: 16 },
+      layout: { x: 0, y: 0, width: 375, height: 100 },
+    },
+  };
+}
+
+// Legacy constant for backwards compatibility
+export const NATIVE_STYLE = createNativeStylePayload(1);
 
 export const STORAGE_API_SUPPORTED = {
   event: 'isBackendStorageAPISupported',
@@ -183,20 +195,36 @@ export const UNSUPPORTED_VERSION = {
 // ERROR MESSAGES
 // ═══════════════════════════════════════════════════════════════════════════
 
-export const ELEMENT_NOT_FOUND = {
-  event: 'inspectedElement',
-  payload: { type: 'not-found' },
-};
+export function createElementNotFoundPayload(id: number, responseID?: number): {
+  event: string;
+  payload: { type: 'not-found'; id: number; responseID?: number };
+} {
+  return {
+    event: 'inspectedElement',
+    payload: { type: 'not-found', id, responseID },
+  };
+}
 
-export const INSPECTION_ERROR = {
-  event: 'inspectedElement',
-  payload: {
-    type: 'error',
-    errorType: 'unknown',
-    message: 'Failed to inspect element',
-    stack: 'Error at line 42',
-  },
-};
+export function createInspectionErrorPayload(id: number, message: string, responseID?: number): {
+  event: string;
+  payload: { type: 'error'; id: number; responseID?: number; errorType: string; message: string; stack?: string };
+} {
+  return {
+    event: 'inspectedElement',
+    payload: {
+      type: 'error',
+      id,
+      responseID,
+      errorType: 'unknown',
+      message,
+      stack: 'Error at line 42',
+    },
+  };
+}
+
+// Legacy constants for backwards compatibility
+export const ELEMENT_NOT_FOUND = createElementNotFoundPayload(1);
+export const INSPECTION_ERROR = createInspectionErrorPayload(1, 'Failed to inspect element');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MALFORMED MESSAGES FOR ERROR HANDLING

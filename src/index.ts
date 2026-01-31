@@ -7,5 +7,12 @@
 export { createServer, type ServerOptions } from './server.js';
 export { DevToolsBridge, type BridgeOptions } from './bridge.js';
 export { createLogger, noopLogger, getLogLevelFromEnv, type Logger, type LogLevel } from './logger.js';
+export {
+  HeadlessDevToolsServer,
+  startHeadlessServer,
+  type HeadlessServerOptions,
+  type ServerState,
+  type ServerStatus,
+} from './headless-server.js';
 export * from './errors.js';
 export * from './types.js';

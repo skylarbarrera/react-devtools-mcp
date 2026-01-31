@@ -1,5 +1,5 @@
 {
-  "name": "@anthropic/react-devtools-mcp",
+  "name": "react-devtools-mcp",
   "version": "0.1.0",
   "description": "MCP server exposing React DevTools functionality to AI agents",
   "type": "module",
@@ -10,7 +10,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "TOOLS.md",
+    "SKILL.md"
   ],
   "scripts": {
     "build": "tsup",
@@ -30,6 +32,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
+    "puppeteer": "^24.36.1",
     "tsup": "^8.0.0",
     "typescript": "^5.6.0",
     "vitest": "^2.0.0"
@@ -47,10 +50,10 @@
     "ai",
     "claude"
   ],
-  "author": "Anthropic",
+  "author": "Skylar Barrera",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/anthropics/react-devtools-mcp"
+    "url": "https://github.com/skylarbarrera/react-devtools-mcp"
   }
 }

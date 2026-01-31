@@ -141,6 +141,20 @@ export class DevToolsBridge extends EventEmitter {
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private requestIdCounter = 0;
   private staleRequestCleanupTimer: NodeJS.Timeout | null = null;
+  /**
+   * Unified fallback key mapping for request/response correlation.
+   * Maps element-based keys to requestID-based keys.
+   *
+   * Flow:
+   * 1. Request sent with requestID=123 for elementID=456
+   * 2. Store mapping: "inspect_456" -> "inspect_123"
+   * 3. Response arrives with responseID=123 OR just id=456
+   * 4. Try "inspect_123" first, fall back to mapping["inspect_456"]
+   * 5. Clean up mapping after resolving
+   *
+   * Needed because some React DevTools backends don't echo responseID reliably.
+   */
+  private responseFallbackKeys: Map<string, string> = new Map();
 
   // Errors/warnings state
   private elementErrors: Map<number, Array<[string, number]>> = new Map();
@@ -159,10 +173,60 @@ export class DevToolsBridge extends EventEmitter {
   // Native inspection state (Phase 2.1)
   private isInspectingNative = false;
 
+  // External communication (for headless server integration)
+  private externalSendFn: ((event: string, payload: unknown) => void) | null = null;
+  private isExternallyAttached = false;
+
   constructor(options: BridgeOptions = {}) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...options };
     this.logger = options.logger ?? noopLogger;
+  }
+
+  /**
+   * Attach to an external message source (e.g., HeadlessDevToolsServer).
+   * When attached, the bridge receives messages from the external source
+   * instead of connecting via WebSocket.
+   */
+  attachToExternal(
+    sendFn: (event: string, payload: unknown) => void,
+    onDetach?: () => void
+  ): { receiveMessage: (data: string) => void; detach: () => void } {
+    this.logger.info('Attaching to external message source');
+    this.externalSendFn = sendFn;
+    this.isExternallyAttached = true;
+
+    // Mark as connected
+    this.setState('connected');
+    this.error = null;
+    this.lastMessageAt = Date.now();
+    this.startStaleRequestCleanup();
+
+    // Send initial handshake
+    this.send('bridge', { version: 2 });
+    this.negotiateCapabilities();
+    this.emit('connected');
+
+    return {
+      receiveMessage: (data: string) => {
+        this.handleMessage(data);
+      },
+      detach: () => {
+        this.logger.info('Detaching from external message source');
+        this.externalSendFn = null;
+        this.isExternallyAttached = false;
+        this.setState('disconnected');
+        this.reset();
+        onDetach?.();
+      },
+    };
+  }
+
+  /**
+   * Check if bridge is attached to an external source
+   */
+  isAttachedExternally(): boolean {
+    return this.isExternallyAttached;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -174,6 +238,12 @@ export class DevToolsBridge extends EventEmitter {
    * Handles deduplication of concurrent connect calls (Phase 1.2).
    */
   async connect(): Promise<ConnectionStatus> {
+    // Already attached externally - no WebSocket connection needed
+    if (this.isExternallyAttached) {
+      this.logger.debug('Already attached externally, skipping WebSocket connect');
+      return this.getStatus();
+    }
+
     // Return existing connection attempt (Phase 1.2: Deduplicate)
     if (this.connectPromise) {
       this.logger.debug('Returning existing connection attempt');
@@ -383,6 +453,10 @@ export class DevToolsBridge extends EventEmitter {
    * Check if connected
    */
   isConnected(): boolean {
+    // Check for external attachment or direct WebSocket connection
+    if (this.isExternallyAttached) {
+      return this.state === 'connected';
+    }
     return this.state === 'connected' && this.ws?.readyState === WebSocket.OPEN;
   }
 
@@ -470,6 +544,60 @@ export class DevToolsBridge extends EventEmitter {
   }
 
   /**
+   * Resolve a correlated request using responseID/requestID/fallback pattern.
+   * Handles the common pattern of: responseID -> requestID -> element ID fallback.
+   *
+   * @param prefix - Key prefix (e.g., 'inspect', 'owners', 'nativeStyle')
+   * @param payload - Response payload with optional responseID, requestID, and id
+   * @param result - Value to resolve the promise with
+   */
+  private resolveCorrelatedRequest(
+    prefix: string,
+    payload: { id?: number; responseID?: number; requestID?: number },
+    result: unknown
+  ): void {
+    // Priority: responseID (official) -> requestID (legacy) -> element id (fallback)
+    let key: string;
+
+    if (payload.responseID !== undefined) {
+      key = `${prefix}_${payload.responseID}`;
+    } else if (payload.requestID !== undefined) {
+      key = `${prefix}_${payload.requestID}`;
+    } else {
+      key = `${prefix}_${payload.id ?? 'unknown'}`;
+    }
+
+    // If key not found directly, check fallback mapping
+    if (!this.pendingRequests.has(key) && payload.id !== undefined) {
+      const fallbackKey = `${prefix}_${payload.id}`;
+      const primaryKey = this.responseFallbackKeys.get(fallbackKey);
+      if (primaryKey && this.pendingRequests.has(primaryKey)) {
+        key = primaryKey;
+      }
+      this.responseFallbackKeys.delete(fallbackKey);
+    } else if (payload.id !== undefined) {
+      // Clean up fallback mapping if we matched directly
+      this.responseFallbackKeys.delete(`${prefix}_${payload.id}`);
+    }
+
+    this.resolvePending(key, result);
+  }
+
+  /**
+   * Store a fallback key mapping for request correlation.
+   * Call this when sending a request that uses requestID.
+   *
+   * @param prefix - Key prefix (e.g., 'inspect', 'owners')
+   * @param requestID - The requestID being sent
+   * @param elementID - The element ID (used as fallback key)
+   */
+  private storeFallbackKey(prefix: string, requestID: number, elementID: number): void {
+    const fallbackKey = `${prefix}_${elementID}`;
+    const primaryKey = `${prefix}_${requestID}`;
+    this.responseFallbackKeys.set(fallbackKey, primaryKey);
+  }
+
+  /**
    * Start periodic cleanup of stale requests (Phase 1.5)
    */
   private startStaleRequestCleanup(): void {
@@ -504,6 +632,13 @@ export class DevToolsBridge extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════════
 
   private send(event: string, payload?: unknown): void {
+    // Use external send function if attached externally
+    if (this.isExternallyAttached && this.externalSendFn) {
+      this.logger.debug('Sending message via external', { event });
+      this.externalSendFn(event, payload);
+      return;
+    }
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new ConnectionError('Not connected');
     }
@@ -582,7 +717,7 @@ export class DevToolsBridge extends EventEmitter {
         break;
 
       case 'NativeStyleEditor_styleAndLayout':
-        this.resolvePending('nativeStyle', payload);
+        this.handleNativeStyleResponse(payload as { id: number; responseID?: number; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } });
         break;
 
       // ═══════════════════════════════════════════════════════════════════════
@@ -608,15 +743,15 @@ export class DevToolsBridge extends EventEmitter {
 
       case 'savedToClipboard':
         this.logger.debug('Content saved to clipboard');
-        this.resolvePending('clipboard', { success: true });
+        this.handleClipboardResponse(payload as { responseID?: number });
         break;
 
       case 'viewAttributeSourceResult':
-        this.handleAttributeSourceResult(payload as { source: SourceLocation | null });
+        this.handleAttributeSourceResult(payload as { id?: number; responseID?: number; source: SourceLocation | null });
         break;
 
       case 'overrideContextResult':
-        this.resolvePending('overrideContext', payload);
+        this.handleOverrideContextResponse(payload as { id?: number; responseID?: number; success: boolean });
         break;
 
       case 'inspectingNativeStarted':
@@ -631,7 +766,7 @@ export class DevToolsBridge extends EventEmitter {
         break;
 
       case 'captureScreenshotResult':
-        this.resolvePending('screenshot', payload);
+        this.handleScreenshotResponse(payload as { id?: number; responseID?: number; screenshot: string | null });
         break;
 
       default:
@@ -704,8 +839,8 @@ export class DevToolsBridge extends EventEmitter {
     }
   }
 
-  private handleAttributeSourceResult(payload: { source: SourceLocation | null }): void {
-    this.resolvePending('attributeSource', payload.source);
+  private handleAttributeSourceResult(payload: { id?: number; responseID?: number; source: SourceLocation | null }): void {
+    this.resolveCorrelatedRequest('attributeSource', payload, payload.source);
     if (payload.source) {
       this.emit('attributeSource', payload.source);
     }
@@ -717,9 +852,51 @@ export class DevToolsBridge extends EventEmitter {
     this.emit('inspectingNativeStopped', payload.elementID);
   }
 
+  private handleNativeStyleResponse(payload: { id: number; responseID?: number; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } }): void {
+    this.resolveCorrelatedRequest('nativeStyle', payload, { style: payload.style, layout: payload.layout });
+  }
+
+  private handleClipboardResponse(payload: { responseID?: number }): void {
+    // Clipboard is special - no element ID. If no responseID, find any pending clipboard request.
+    if (payload.responseID !== undefined) {
+      this.resolvePending(`clipboard_${payload.responseID}`, { success: true });
+    } else {
+      // Fallback: find any pending clipboard request
+      for (const pendingKey of this.pendingRequests.keys()) {
+        if (pendingKey.startsWith('clipboard_')) {
+          this.resolvePending(pendingKey, { success: true });
+          break;
+        }
+      }
+    }
+  }
+
+  private handleOverrideContextResponse(payload: { id?: number; responseID?: number; success: boolean }): void {
+    this.resolveCorrelatedRequest('overrideContext', payload, payload);
+  }
+
+  private handleScreenshotResponse(payload: { id?: number; responseID?: number; screenshot: string | null }): void {
+    this.resolveCorrelatedRequest('screenshot', payload, payload);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // OPERATIONS PARSING (Phase 1.4: Bounds Checking)
   // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Decode UTF-8 string from operations array
+   * Based on react-devtools-shared/src/utils.js utfDecodeStringWithRanges
+   */
+  private utfDecodeString(operations: number[], start: number, end: number): string {
+    let result = '';
+    for (let i = start; i <= end; i++) {
+      const charCode = operations[i];
+      if (typeof charCode === 'number' && charCode >= 0 && charCode <= 0x10FFFF) {
+        result += String.fromCodePoint(charCode);
+      }
+    }
+    return result;
+  }
 
   private handleOperations(operations: number[]): void {
     if (!Array.isArray(operations)) {
@@ -727,16 +904,51 @@ export class DevToolsBridge extends EventEmitter {
       return;
     }
 
-    if (operations.length < 2) {
+    if (operations.length < 3) {
       this.logger.debug('Empty operations array');
       return;
     }
 
     const rendererID = operations[0];
-    let i = 1;
+    const rootID = operations[1];
 
-    this.logger.debug('Processing operations', { rendererID, count: operations.length });
+    // Track root
+    if (rootID !== 0) {
+      this.rootIDs.add(rootID);
+    }
 
+    // Parse string table (index 2 onwards)
+    // Format: [stringTableSize, [len1, ...chars1], [len2, ...chars2], ...]
+    let i = 2;
+    const stringTableSize = operations[i];
+    i++;
+
+    // Build string table (index 0 = null)
+    const stringTable: Array<string | null> = [null];
+    const stringTableEnd = i + stringTableSize;
+
+    while (i < stringTableEnd && i < operations.length) {
+      const strLength = operations[i];
+      i++;
+
+      if (strLength > 0 && i + strLength - 1 < operations.length) {
+        const str = this.utfDecodeString(operations, i, i + strLength - 1);
+        stringTable.push(str);
+        i += strLength;
+      } else {
+        stringTable.push('');
+      }
+    }
+
+    this.logger.debug('Parsed string table', {
+      rendererID,
+      rootID,
+      stringCount: stringTable.length - 1,
+      strings: stringTable.slice(1),
+      operationsStart: i
+    });
+
+    // Now parse actual operations (starting at stringTableEnd)
     while (i < operations.length) {
       const op = operations[i];
 
@@ -748,7 +960,7 @@ export class DevToolsBridge extends EventEmitter {
 
       switch (op) {
         case TREE_OP.ADD:
-          i = this.processAddOperation(operations, i + 1, rendererID);
+          i = this.processAddOperation(operations, i + 1, rendererID, stringTable);
           break;
 
         case TREE_OP.REMOVE:
@@ -784,84 +996,97 @@ export class DevToolsBridge extends EventEmitter {
   }
 
   /**
-   * Process ADD operation with bounds checking (Phase 1.4) and renderer tracking (Phase 2.3)
+   * Process ADD operation with string table lookup
+   * Based on react-devtools-shared/src/devtools/store.js onBridgeOperations
+   *
+   * Root format: [id, type=11, isStrictModeCompliant, profilerFlags, supportsStrictMode, hasOwnerMetadata]
+   * Non-root format: [id, type, parentID, ownerID, displayNameStringID, keyStringID, namePropStringID]
    */
-  private processAddOperation(ops: number[], i: number, rendererID: number): number {
-    // Minimum fields: id, type, parentID, ownerID, displayNameLen
-    const minRequired = 5;
-    if (i + minRequired > ops.length) {
-      this.logger.warn('ADD operation: insufficient data', { index: i, available: ops.length - i, needed: minRequired });
-      return ops.length; // Skip to end
+  private processAddOperation(ops: number[], i: number, rendererID: number, stringTable: Array<string | null>): number {
+    // Need at least id and type
+    if (i + 2 > ops.length) {
+      this.logger.warn('ADD operation: insufficient data for id/type', { index: i, available: ops.length - i });
+      return ops.length;
     }
 
     const id = ops[i++];
     const type = ops[i++];
-    const parentID = ops[i++];
-    const ownerID = ops[i++];
-    const displayNameLength = ops[i++];
 
-    // Validate displayNameLength
-    if (displayNameLength < 0 || displayNameLength > 10000) {
-      this.logger.warn('ADD operation: invalid displayNameLength', { displayNameLength, id });
-      return ops.length;
-    }
-
-    // Check we have enough bytes for display name
-    if (i + displayNameLength > ops.length) {
-      this.logger.warn('ADD operation: displayName extends past array', {
-        needed: displayNameLength,
-        available: ops.length - i,
-      });
-      return ops.length;
-    }
-
-    // Read display name
-    let displayName = '';
-    for (let j = 0; j < displayNameLength; j++) {
-      const charCode = ops[i++];
-      if (typeof charCode === 'number' && charCode >= 0 && charCode <= 0x10FFFF) {
-        displayName += String.fromCharCode(charCode);
-      }
-    }
-
-    // Check for key length field
-    if (i >= ops.length) {
-      this.logger.warn('ADD operation: missing keyLength field', { id });
-      return ops.length;
-    }
-
-    const keyLength = ops[i++];
-    let key: string | null = null;
-
-    // Validate keyLength
-    if (keyLength < 0 || keyLength > 10000) {
-      this.logger.warn('ADD operation: invalid keyLength', { keyLength, id });
-      return ops.length;
-    }
-
-    // Check we have enough bytes for key
-    if (keyLength > 0) {
-      if (i + keyLength > ops.length) {
-        this.logger.warn('ADD operation: key extends past array', {
-          needed: keyLength,
-          available: ops.length - i,
-        });
+    // ElementTypeRoot (11) has special format
+    if (type === 11) { // ElementTypeRoot
+      // Root format: [isStrictModeCompliant, profilerFlags, supportsStrictMode, hasOwnerMetadata]
+      // Need at least 4 more fields for root
+      if (i + 4 > ops.length) {
+        this.logger.warn('ADD root: insufficient data', { index: i, available: ops.length - i, needed: 4 });
         return ops.length;
       }
 
-      key = '';
-      for (let j = 0; j < keyLength; j++) {
-        const charCode = ops[i++];
-        if (typeof charCode === 'number' && charCode >= 0 && charCode <= 0x10FFFF) {
-          key += String.fromCharCode(charCode);
-        }
+      const isStrictModeCompliant = ops[i++] > 0;
+      const profilerFlags = ops[i++];
+      const supportsStrictMode = ops[i++] > 0;
+      const hasOwnerMetadata = ops[i++] > 0;
+
+      const element: Element = {
+        id,
+        parentID: null,
+        displayName: 'Root',
+        type: 'root',
+        key: null,
+        depth: 0,
+        weight: 1,
+        ownerID: null,
+        hasChildren: false,
+        env: null,
+        hocDisplayNames: null,
+      };
+
+      this.rootIDs.add(id);
+      this.elements.set(id, element);
+      this.elementToRenderer.set(id, rendererID);
+
+      const renderer = this.renderers.get(rendererID);
+      if (renderer) {
+        renderer.rootIDs.add(id);
+        renderer.elementIDs.add(id);
       }
+
+      this.logger.debug('Added root element', {
+        id,
+        rendererID,
+        isStrictModeCompliant,
+        profilerFlags,
+        supportsStrictMode,
+        hasOwnerMetadata
+      });
+      this.emit('elementAdded', element);
+      return i;
     }
+
+    // Non-root elements: [parentID, ownerID, displayNameStringID, keyStringID, namePropStringID]
+    // Need 5 more fields
+    if (i + 5 > ops.length) {
+      this.logger.warn('ADD operation: insufficient data', { index: i, available: ops.length - i, needed: 5 });
+      return ops.length;
+    }
+
+    const parentID = ops[i++];
+    const ownerID = ops[i++];
+    const displayNameStringID = ops[i++];
+    const keyStringID = ops[i++];
+    i++; // Skip namePropStringID - used for server components, not tracked yet
+
+    // Look up strings from string table (index 0 = null)
+    const displayName = (displayNameStringID > 0 && displayNameStringID < stringTable.length)
+      ? (stringTable[displayNameStringID] ?? 'Unknown')
+      : 'Unknown';
+    const key = (keyStringID > 0 && keyStringID < stringTable.length)
+      ? stringTable[keyStringID]
+      : null;
 
     const element: Element = {
       id,
       parentID: parentID === 0 ? null : parentID,
-      displayName: displayName || 'Unknown',
+      displayName,
       type: ELEMENT_TYPE_MAP[type] ?? 'function',
       key,
       depth: 0,
@@ -881,25 +1106,15 @@ export class DevToolsBridge extends EventEmitter {
       }
     }
 
-    // Track root
-    if (element.type === 'root') {
-      this.rootIDs.add(id);
-      // Phase 2.3: Track root in renderer
-      const renderer = this.renderers.get(rendererID);
-      if (renderer) {
-        renderer.rootIDs.add(id);
-      }
-    }
-
     this.elements.set(id, element);
-
-    // Phase 2.3: Track element-to-renderer mapping
     this.elementToRenderer.set(id, rendererID);
+
     const renderer = this.renderers.get(rendererID);
     if (renderer) {
       renderer.elementIDs.add(id);
     }
 
+    this.logger.debug('Added element', { id, displayName, type: element.type, parentID });
     this.emit('elementAdded', element);
 
     return i;
@@ -1014,21 +1229,12 @@ export class DevToolsBridge extends EventEmitter {
   // RESPONSE HANDLERS (Phase 1.6: ID Correlation)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private handleInspectedElement(payload: InspectElementPayload & { requestID?: number; id?: number }): void {
-    // Try to match by requestID first (Phase 1.6), fall back to element ID
-    const key = payload.requestID !== undefined
-      ? `inspect_${payload.requestID}`
-      : `inspect_${payload.id ?? 'unknown'}`;
-
-    this.resolvePending(key, payload);
+  private handleInspectedElement(payload: InspectElementPayload & { responseID?: number; requestID?: number; id?: number }): void {
+    this.resolveCorrelatedRequest('inspect', payload, payload);
   }
 
-  private handleOwnersList(payload: { id: number; requestID?: number; owners: SerializedElement[] }): void {
-    const key = payload.requestID !== undefined
-      ? `owners_${payload.requestID}`
-      : `owners_${payload.id}`;
-
-    this.resolvePending(key, payload.owners);
+  private handleOwnersList(payload: { id: number; responseID?: number; requestID?: number; owners: SerializedElement[] }): void {
+    this.resolveCorrelatedRequest('owners', payload, payload.owners);
   }
 
   private handleProfilingData(payload: ProfilingData): void {
@@ -1123,11 +1329,16 @@ export class DevToolsBridge extends EventEmitter {
 
     const rendererID = this.getRendererIDForElement(id);
     if (rendererID === null) {
-      return { type: 'not-found' };
+      return { type: 'not-found', id };
     }
 
     const requestID = this.nextRequestId();
-    const promise = this.createPending(`inspect_${requestID}`, `inspectElement(${id})`);
+    // Create pending with requestID key, but also register element ID as fallback
+    const primaryKey = `inspect_${requestID}`;
+    const promise = this.createPending(primaryKey, `inspectElement(${id})`);
+
+    // Store fallback mapping in case React doesn't echo responseID
+    this.storeFallbackKey('inspect', requestID, id);
 
     this.send('inspectElement', {
       id,
@@ -1152,7 +1363,11 @@ export class DevToolsBridge extends EventEmitter {
     }
 
     const requestID = this.nextRequestId();
-    const promise = this.createPending(`owners_${requestID}`, `getOwnersList(${id})`);
+    const primaryKey = `owners_${requestID}`;
+    const promise = this.createPending(primaryKey, `getOwnersList(${id})`);
+
+    // Store fallback mapping in case React doesn't echo responseID
+    this.storeFallbackKey('owners', requestID, id);
 
     this.send('getOwnersList', { id, rendererID, requestID });
 
@@ -1363,8 +1578,14 @@ export class DevToolsBridge extends EventEmitter {
       return { style: null, layout: null };
     }
 
-    const promise = this.createPending('nativeStyle', `getNativeStyle(${id})`);
-    this.send('NativeStyleEditor_measure', { id, rendererID });
+    const requestID = this.nextRequestId();
+    const primaryKey = `nativeStyle_${requestID}`;
+    const promise = this.createPending(primaryKey, `getNativeStyle(${id})`);
+
+    // Store fallback mapping in case backend doesn't echo responseID
+    this.storeFallbackKey('nativeStyle', requestID, id);
+
+    this.send('NativeStyleEditor_measure', { id, rendererID, requestID });
     return promise as Promise<{ style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } }>;
   }
 
@@ -1384,8 +1605,12 @@ export class DevToolsBridge extends EventEmitter {
    */
   async saveToClipboard(value: string): Promise<{ success: boolean }> {
     this.ensureConnected();
-    const promise = this.createPending('clipboard', 'saveToClipboard');
-    this.send('saveToClipboard', { value });
+
+    const requestID = this.nextRequestId();
+    const primaryKey = `clipboard_${requestID}`;
+    const promise = this.createPending(primaryKey, 'saveToClipboard');
+
+    this.send('saveToClipboard', { value, requestID });
 
     // Timeout fallback - clipboard save doesn't always respond
     return Promise.race([
@@ -1404,8 +1629,14 @@ export class DevToolsBridge extends EventEmitter {
     const rendererID = this.getRendererIDForElement(id);
     if (rendererID === null) return null;
 
-    const promise = this.createPending('attributeSource', `viewAttributeSource(${id})`);
-    this.send('viewAttributeSource', { id, rendererID, path });
+    const requestID = this.nextRequestId();
+    const primaryKey = `attributeSource_${requestID}`;
+    const promise = this.createPending(primaryKey, `viewAttributeSource(${id})`);
+
+    // Store fallback mapping
+    this.storeFallbackKey('attributeSource', requestID, id);
+
+    this.send('viewAttributeSource', { id, rendererID, path, requestID });
     return promise as Promise<SourceLocation | null>;
   }
 
@@ -1417,8 +1648,14 @@ export class DevToolsBridge extends EventEmitter {
     const rendererID = this.getRendererIDForElement(id);
     if (rendererID === null) return false;
 
-    const promise = this.createPending('overrideContext', `overrideContext(${id})`);
-    this.send('overrideContext', { id, rendererID, path, value });
+    const requestID = this.nextRequestId();
+    const primaryKey = `overrideContext_${requestID}`;
+    const promise = this.createPending(primaryKey, `overrideContext(${id})`);
+
+    // Store fallback mapping
+    this.storeFallbackKey('overrideContext', requestID, id);
+
+    this.send('overrideContext', { id, rendererID, path, value, requestID });
 
     try {
       const result = await promise as { success: boolean };
@@ -1463,8 +1700,14 @@ export class DevToolsBridge extends EventEmitter {
     const rendererID = this.getRendererIDForElement(id);
     if (rendererID === null) return null;
 
-    const promise = this.createPending('screenshot', `captureScreenshot(${id})`);
-    this.send('captureScreenshot', { id, rendererID });
+    const requestID = this.nextRequestId();
+    const primaryKey = `screenshot_${requestID}`;
+    const promise = this.createPending(primaryKey, `captureScreenshot(${id})`);
+
+    // Store fallback mapping
+    this.storeFallbackKey('screenshot', requestID, id);
+
+    this.send('captureScreenshot', { id, rendererID, requestID });
 
     try {
       const result = await promise as { screenshot: string | null };

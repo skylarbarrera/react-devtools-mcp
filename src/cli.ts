@@ -1,12 +1,10 @@
-#!/usr/bin/env node
-
 /**
  * React DevTools MCP Server - CLI Entry Point
  *
  * Starts the MCP server that exposes React DevTools functionality.
  *
  * Usage:
- *   npx @anthropic/react-devtools-mcp
+ *   npx react-devtools-mcp
  *
  * Environment Variables:
  *   DEVTOOLS_HOST - Host to connect to (default: localhost)

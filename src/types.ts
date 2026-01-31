@@ -153,12 +153,21 @@ export interface InspectedElement {
   nativeTag: number | null;
 }
 
+/**
+ * InspectElementPayload - Response from backend for element inspection.
+ *
+ * Official React DevTools protocol includes:
+ * - `id`: The element ID being inspected
+ * - `responseID`: Echoes back the requestID from the request (used for correlation)
+ *
+ * Note: Some backends may omit responseID, so we handle fallback to element id.
+ */
 export type InspectElementPayload =
-  | { type: 'full-data'; element: InspectedElement }
-  | { type: 'hydrated-path'; path: Array<string | number>; value: unknown }
-  | { type: 'no-change' }
-  | { type: 'not-found' }
-  | { type: 'error'; errorType: string; message: string; stack?: string };
+  | { type: 'full-data'; id: number; responseID?: number; element: InspectedElement }
+  | { type: 'hydrated-path'; id: number; responseID?: number; path: Array<string | number>; value: unknown }
+  | { type: 'no-change'; id: number; responseID?: number }
+  | { type: 'not-found'; id: number; responseID?: number }
+  | { type: 'error'; id: number; responseID?: number; errorType: string; message: string; stack?: string };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HOOKS
@@ -375,26 +384,32 @@ export type BridgeOutgoing =
 
 export type OverrideTarget = 'props' | 'state' | 'hooks' | 'context';
 
+/**
+ * BridgeIncoming - Messages from React DevTools backend.
+ *
+ * Response correlation: Official protocol uses `responseID` to echo back the `requestID`.
+ * We support both `responseID` (official) and fallback to element `id` for compatibility.
+ */
 export type BridgeIncoming =
   | { type: 'inspectedElement'; payload: InspectElementPayload }
   | { type: 'operations'; operations: number[] }
-  | { type: 'ownersList'; owners: SerializedElement[] }
+  | { type: 'ownersList'; id: number; responseID?: number; owners: SerializedElement[] }
   | { type: 'profilingData'; data: ProfilingData }
   | { type: 'profilingStatus'; isProfiling: boolean }
   | { type: 'backendVersion'; version: string }
   | { type: 'bridgeProtocol'; version: number }
-  | { type: 'NativeStyleEditor_styleAndLayout'; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } }
-  // Phase 2.1: Additional message types
+  | { type: 'NativeStyleEditor_styleAndLayout'; id: number; responseID?: number; style: Record<string, unknown>; layout: { x: number; y: number; width: number; height: number } }
+  // Phase 2.1: Additional message types (with request correlation)
   | { type: 'isBackendStorageAPISupported'; isSupported: boolean }
   | { type: 'isSynchronousXHRSupported'; isSupported: boolean }
   | { type: 'getSupportedRendererInterfaces'; rendererInterfaces: RendererInterface[] }
   | { type: 'updateComponentFilters' }
-  | { type: 'savedToClipboard' }
-  | { type: 'viewAttributeSourceResult'; source: SourceLocation | null }
-  | { type: 'overrideContextResult'; success: boolean }
+  | { type: 'savedToClipboard'; responseID?: number }
+  | { type: 'viewAttributeSourceResult'; id: number; responseID?: number; source: SourceLocation | null }
+  | { type: 'overrideContextResult'; id: number; responseID?: number; success: boolean }
   | { type: 'inspectingNativeStarted' }
   | { type: 'inspectingNativeStopped'; elementID: number | null }
-  | { type: 'captureScreenshotResult'; screenshot: string | null };
+  | { type: 'captureScreenshotResult'; id: number; responseID?: number; screenshot: string | null };
 
 // Renderer interface capabilities
 export interface RendererInterface {

@@ -193,16 +193,28 @@ describe('Operations Fuzz Testing', () => {
       // First add a root element
       ws.simulateMessage('operations', [
         1, // rendererID
-        TREE_OP.ADD, 1, ELEMENT_TYPES.ROOT, 0, 0, 4, 82, 111, 111, 116, 0, // id=1, Root
+        1, // rootID
+        0, // stringTableSize = 0 (no strings)
+        // Root ADD: op, id, type, isStrictModeCompliant, profilerFlags, supportsStrictMode, hasOwnerMetadata
+        TREE_OP.ADD, 1, ELEMENT_TYPES.ROOT, 0, 0, 1, 1,
       ]);
       await flushPromises();
 
+      // Verify root was added
+      expect(bridge.getComponentTree().length).toBeGreaterThan(0);
+
       // Send valid operations adding children to root
+      // String table format: [size, len, ...chars]
+      // "Test" = [4, 4, 84, 101, 115, 116]
       for (let i = 0; i < 50; i++) {
         const id = 100 + i;
         ws.simulateMessage('operations', [
           1, // rendererID
-          TREE_OP.ADD, id, ELEMENT_TYPES.FUNCTION, 1, 0, 4, 84, 101, 115, 116, 0, // parentID=1
+          1, // rootID
+          5, // stringTableSize (1 + 4 chars)
+          4, 84, 101, 115, 116, // "Test"
+          // Non-root ADD: op, id, type, parentID, ownerID, displayNameStringID, keyStringID, namePropStringID
+          TREE_OP.ADD, id, ELEMENT_TYPES.FUNCTION, 1, 0, 1, 0, 0, // displayName = string[1] = "Test"
         ]);
         await flushPromises();
       }

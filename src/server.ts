@@ -16,6 +16,7 @@ import {
 import { DevToolsBridge } from './bridge.js';
 import { createLogger, getLogLevelFromEnv, type Logger } from './logger.js';
 import type { ComponentFilter } from './types.js';
+import { HeadlessDevToolsServer, startHeadlessServer } from './headless-server.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TOOL DEFINITIONS
@@ -555,6 +556,14 @@ export interface ServerOptions {
   port?: number;
   autoConnect?: boolean;
   logger?: Logger;
+  /**
+   * Run in standalone mode with embedded DevTools server.
+   * When true, starts a headless WebSocket server that React apps can connect to directly.
+   * No need for external `npx react-devtools` - works fully standalone.
+   *
+   * Default: true (can be disabled via DEVTOOLS_STANDALONE=false env var)
+   */
+  standalone?: boolean;
 }
 
 export function createServer(options: ServerOptions = {}) {
@@ -563,9 +572,16 @@ export function createServer(options: ServerOptions = {}) {
     prefix: 'devtools-mcp',
   });
 
+  const host = options.host ?? process.env.DEVTOOLS_HOST ?? 'localhost';
+  const port = options.port ?? (Number(process.env.DEVTOOLS_PORT) || 8097);
+
+  // Standalone mode: run embedded DevTools server (default: true)
+  const standalone = options.standalone ?? (process.env.DEVTOOLS_STANDALONE !== 'false');
+  let headlessServer: HeadlessDevToolsServer | null = null;
+
   const bridge = new DevToolsBridge({
-    host: options.host ?? process.env.DEVTOOLS_HOST ?? 'localhost',
-    port: options.port ?? (Number(process.env.DEVTOOLS_PORT) || 8097),
+    host,
+    port,
     timeout: Number(process.env.DEVTOOLS_TIMEOUT) || 5000,
     logger: logger.child('bridge'),
   });
@@ -672,17 +688,84 @@ export function createServer(options: ServerOptions = {}) {
   return {
     server,
     bridge,
+    headlessServer: () => headlessServer,
     async start() {
+      // Start embedded DevTools server in standalone mode
+      if (standalone) {
+        try {
+          logger.info('Starting standalone mode with embedded DevTools server', { host, port });
+          headlessServer = await startHeadlessServer({
+            host,
+            port,
+            logger: logger.child('headless'),
+          });
+
+          let bridgeHandle: { receiveMessage: (data: string) => void; detach: () => void } | null = null;
+
+          // Add message listener BEFORE any connections happen
+          // This ensures we don't miss early messages
+          headlessServer!.addMessageListener((event, payload) => {
+            if (bridgeHandle) {
+              // Convert to JSON string for bridge's handleMessage
+              const data = JSON.stringify({ event, payload });
+              bridgeHandle.receiveMessage(data);
+            } else {
+              logger.debug('Message received before bridge attached', { event });
+            }
+          });
+
+          // When React app connects, wire up the MCP bridge
+          headlessServer.on('connected', () => {
+            logger.info('React app connected to embedded DevTools server');
+
+            // Attach MCP bridge to receive messages from headless server
+            bridgeHandle = bridge.attachToExternal(
+              (event, payload) => {
+                // Send messages through headless server's WebSocket
+                headlessServer!.sendMessage(event, payload);
+              },
+              () => {
+                logger.info('MCP bridge detached from headless server');
+              }
+            );
+          });
+
+          headlessServer.on('disconnected', () => {
+            logger.info('React app disconnected from embedded DevTools server');
+            bridgeHandle?.detach();
+            bridgeHandle = null;
+          });
+
+          headlessServer.on('error', (err: Error) => {
+            logger.error('Embedded DevTools server error', { error: err.message });
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Unknown error';
+          logger.error('Failed to start embedded DevTools server', { error: message });
+          // Continue without standalone mode - user can run external devtools
+        }
+      }
+
+      // Connect MCP transport
       const transport = new StdioServerTransport();
       await server.connect(transport);
 
-      if (autoConnect) {
+      // Connect bridge to DevTools (skip if using standalone mode - bridge is attached to headless server)
+      if (autoConnect && !standalone) {
         try {
           await bridge.connect();
         } catch {
           // Connection failure is not fatal - tools can connect later
         }
       }
+    },
+
+    async stop() {
+      if (headlessServer) {
+        await headlessServer.stop();
+        headlessServer = null;
+      }
+      bridge.disconnect();
     },
   };
 }
