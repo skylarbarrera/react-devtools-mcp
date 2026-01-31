@@ -1,12 +1,12 @@
 {
-  "name": "react-devtools-mcp",
+  "name": "react-devtools-bridge",
   "version": "0.1.0",
   "description": "MCP server exposing React DevTools functionality to AI agents",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "react-devtools-mcp": "./dist/cli.js"
+    "react-devtools-bridge": "./dist/cli.js"
   },
   "files": [
     "dist",

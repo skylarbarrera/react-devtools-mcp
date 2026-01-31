@@ -4,7 +4,7 @@
  * Starts the MCP server that exposes React DevTools functionality.
  *
  * Usage:
- *   npx react-devtools-mcp
+ *   npx react-devtools-bridge
  *
  * Environment Variables:
  *   DEVTOOLS_HOST - Host to connect to (default: localhost)

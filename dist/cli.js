@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-#!/usr/bin/env node
 
 // src/server.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -147,6 +146,18 @@ var RECONNECT = {
   BASE_DELAY: 1e3,
   MAX_DELAY: 3e4
 };
+var DEFAULT_CAPABILITIES = {
+  bridgeProtocolVersion: 2,
+  backendVersion: null,
+  supportsInspectElementPaths: false,
+  supportsProfilingChangeDescriptions: false,
+  supportsTimeline: false,
+  supportsNativeStyleEditor: false,
+  supportsErrorBoundaryTesting: false,
+  supportsTraceUpdates: false,
+  isBackendStorageAPISupported: false,
+  isSynchronousXHRSupported: false
+};
 var DevToolsBridge = class extends EventEmitter {
   config;
   logger;
@@ -163,23 +174,82 @@ var DevToolsBridge = class extends EventEmitter {
   elements = /* @__PURE__ */ new Map();
   rootIDs = /* @__PURE__ */ new Set();
   renderers = /* @__PURE__ */ new Map();
+  elementToRenderer = /* @__PURE__ */ new Map();
+  // Phase 2.3: Element-to-renderer mapping
   // Request tracking (Phase 1.5 & 1.6: Memory leak fix + ID correlation)
   pendingRequests = /* @__PURE__ */ new Map();
   requestIdCounter = 0;
   staleRequestCleanupTimer = null;
+  /**
+   * Unified fallback key mapping for request/response correlation.
+   * Maps element-based keys to requestID-based keys.
+   *
+   * Flow:
+   * 1. Request sent with requestID=123 for elementID=456
+   * 2. Store mapping: "inspect_456" -> "inspect_123"
+   * 3. Response arrives with responseID=123 OR just id=456
+   * 4. Try "inspect_123" first, fall back to mapping["inspect_456"]
+   * 5. Clean up mapping after resolving
+   *
+   * Needed because some React DevTools backends don't echo responseID reliably.
+   */
+  responseFallbackKeys = /* @__PURE__ */ new Map();
   // Errors/warnings state
   elementErrors = /* @__PURE__ */ new Map();
   elementWarnings = /* @__PURE__ */ new Map();
   // Profiling state
   isProfiling = false;
   profilingData = null;
-  // Protocol info
+  // Protocol info (Phase 2.2)
   backendVersion = null;
+  capabilities = { ...DEFAULT_CAPABILITIES };
+  capabilitiesNegotiated = false;
   lastMessageAt = 0;
+  // Native inspection state (Phase 2.1)
+  isInspectingNative = false;
+  // External communication (for headless server integration)
+  externalSendFn = null;
+  isExternallyAttached = false;
   constructor(options = {}) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...options };
     this.logger = options.logger ?? noopLogger;
+  }
+  /**
+   * Attach to an external message source (e.g., HeadlessDevToolsServer).
+   * When attached, the bridge receives messages from the external source
+   * instead of connecting via WebSocket.
+   */
+  attachToExternal(sendFn, onDetach) {
+    this.logger.info("Attaching to external message source");
+    this.externalSendFn = sendFn;
+    this.isExternallyAttached = true;
+    this.setState("connected");
+    this.error = null;
+    this.lastMessageAt = Date.now();
+    this.startStaleRequestCleanup();
+    this.send("bridge", { version: 2 });
+    this.negotiateCapabilities();
+    this.emit("connected");
+    return {
+      receiveMessage: (data) => {
+        this.handleMessage(data);
+      },
+      detach: () => {
+        this.logger.info("Detaching from external message source");
+        this.externalSendFn = null;
+        this.isExternallyAttached = false;
+        this.setState("disconnected");
+        this.reset();
+        onDetach?.();
+      }
+    };
+  }
+  /**
+   * Check if bridge is attached to an external source
+   */
+  isAttachedExternally() {
+    return this.isExternallyAttached;
   }
   // ═══════════════════════════════════════════════════════════════════════════
   // CONNECTION MANAGEMENT
@@ -189,6 +259,10 @@ var DevToolsBridge = class extends EventEmitter {
    * Handles deduplication of concurrent connect calls (Phase 1.2).
    */
   async connect() {
+    if (this.isExternallyAttached) {
+      this.logger.debug("Already attached externally, skipping WebSocket connect");
+      return this.getStatus();
+    }
     if (this.connectPromise) {
       this.logger.debug("Returning existing connection attempt");
       return this.connectPromise;
@@ -268,7 +342,17 @@ var DevToolsBridge = class extends EventEmitter {
     }
     this.startStaleRequestCleanup();
     this.send("bridge", { version: 2 });
+    this.negotiateCapabilities();
     this.emit("connected");
+  }
+  /**
+   * Negotiate protocol capabilities with backend (Phase 2.2)
+   */
+  negotiateCapabilities() {
+    this.logger.debug("Negotiating protocol capabilities");
+    this.send("isBackendStorageAPISupported", {});
+    this.send("isSynchronousXHRSupported", {});
+    this.send("getSupportedRendererInterfaces", {});
   }
   /**
    * Handle WebSocket close event
@@ -341,6 +425,9 @@ var DevToolsBridge = class extends EventEmitter {
    * Check if connected
    */
   isConnected() {
+    if (this.isExternallyAttached) {
+      return this.state === "connected";
+    }
     return this.state === "connected" && this.ws?.readyState === WebSocket.OPEN;
   }
   setState(state) {
@@ -355,10 +442,14 @@ var DevToolsBridge = class extends EventEmitter {
     this.elements.clear();
     this.rootIDs.clear();
     this.renderers.clear();
+    this.elementToRenderer.clear();
     this.elementErrors.clear();
     this.elementWarnings.clear();
     this.isProfiling = false;
     this.profilingData = null;
+    this.isInspectingNative = false;
+    this.capabilities = { ...DEFAULT_CAPABILITIES };
+    this.capabilitiesNegotiated = false;
     this.stopStaleRequestCleanup();
   }
   // ═══════════════════════════════════════════════════════════════════════════
@@ -414,6 +505,48 @@ var DevToolsBridge = class extends EventEmitter {
     }
   }
   /**
+   * Resolve a correlated request using responseID/requestID/fallback pattern.
+   * Handles the common pattern of: responseID -> requestID -> element ID fallback.
+   *
+   * @param prefix - Key prefix (e.g., 'inspect', 'owners', 'nativeStyle')
+   * @param payload - Response payload with optional responseID, requestID, and id
+   * @param result - Value to resolve the promise with
+   */
+  resolveCorrelatedRequest(prefix, payload, result) {
+    let key;
+    if (payload.responseID !== void 0) {
+      key = `${prefix}_${payload.responseID}`;
+    } else if (payload.requestID !== void 0) {
+      key = `${prefix}_${payload.requestID}`;
+    } else {
+      key = `${prefix}_${payload.id ?? "unknown"}`;
+    }
+    if (!this.pendingRequests.has(key) && payload.id !== void 0) {
+      const fallbackKey = `${prefix}_${payload.id}`;
+      const primaryKey = this.responseFallbackKeys.get(fallbackKey);
+      if (primaryKey && this.pendingRequests.has(primaryKey)) {
+        key = primaryKey;
+      }
+      this.responseFallbackKeys.delete(fallbackKey);
+    } else if (payload.id !== void 0) {
+      this.responseFallbackKeys.delete(`${prefix}_${payload.id}`);
+    }
+    this.resolvePending(key, result);
+  }
+  /**
+   * Store a fallback key mapping for request correlation.
+   * Call this when sending a request that uses requestID.
+   *
+   * @param prefix - Key prefix (e.g., 'inspect', 'owners')
+   * @param requestID - The requestID being sent
+   * @param elementID - The element ID (used as fallback key)
+   */
+  storeFallbackKey(prefix, requestID, elementID) {
+    const fallbackKey = `${prefix}_${elementID}`;
+    const primaryKey = `${prefix}_${requestID}`;
+    this.responseFallbackKeys.set(fallbackKey, primaryKey);
+  }
+  /**
    * Start periodic cleanup of stale requests (Phase 1.5)
    */
   startStaleRequestCleanup() {
@@ -444,6 +577,11 @@ var DevToolsBridge = class extends EventEmitter {
   // MESSAGE HANDLING
   // ═══════════════════════════════════════════════════════════════════════════
   send(event, payload) {
+    if (this.isExternallyAttached && this.externalSendFn) {
+      this.logger.debug("Sending message via external", { event });
+      this.externalSendFn(event, payload);
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new ConnectionError("Not connected");
     }
@@ -504,7 +642,45 @@ var DevToolsBridge = class extends EventEmitter {
         this.disconnect();
         break;
       case "NativeStyleEditor_styleAndLayout":
-        this.resolvePending("nativeStyle", payload);
+        this.handleNativeStyleResponse(payload);
+        break;
+      // ═══════════════════════════════════════════════════════════════════════
+      // Phase 2.1: Additional Message Handlers
+      // ═══════════════════════════════════════════════════════════════════════
+      case "isBackendStorageAPISupported":
+        this.handleStorageSupport(payload);
+        break;
+      case "isSynchronousXHRSupported":
+        this.handleXHRSupport(payload);
+        break;
+      case "getSupportedRendererInterfaces":
+        this.handleRendererInterfaces(payload);
+        break;
+      case "updateComponentFilters":
+        this.logger.debug("Component filters updated");
+        this.emit("filtersUpdated");
+        break;
+      case "savedToClipboard":
+        this.logger.debug("Content saved to clipboard");
+        this.handleClipboardResponse(payload);
+        break;
+      case "viewAttributeSourceResult":
+        this.handleAttributeSourceResult(payload);
+        break;
+      case "overrideContextResult":
+        this.handleOverrideContextResponse(payload);
+        break;
+      case "inspectingNativeStarted":
+        this.isInspectingNative = true;
+        this.logger.info("Native inspection started");
+        this.emit("inspectingNativeStarted");
+        break;
+      case "inspectingNativeStopped":
+        this.isInspectingNative = false;
+        this.handleInspectingNativeStopped(payload);
+        break;
+      case "captureScreenshotResult":
+        this.handleScreenshotResponse(payload);
         break;
       default:
         this.logger.debug("Unknown message type", { event });
@@ -512,29 +688,142 @@ var DevToolsBridge = class extends EventEmitter {
     }
   }
   handleRenderer(payload) {
-    this.renderers.set(payload.id, {
+    const renderer = {
       id: payload.id,
       version: payload.rendererVersion,
-      packageName: payload.rendererPackageName
-    });
+      packageName: payload.rendererPackageName,
+      rootIDs: /* @__PURE__ */ new Set(),
+      elementIDs: /* @__PURE__ */ new Set()
+    };
+    this.renderers.set(payload.id, renderer);
     this.logger.info("Renderer connected", { id: payload.id, version: payload.rendererVersion });
-    this.emit("renderer", payload);
+    this.emit("renderer", { id: payload.id, rendererVersion: payload.rendererVersion });
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Phase 2.1: Capability Detection Handlers
+  // ═══════════════════════════════════════════════════════════════════════════
+  handleStorageSupport(payload) {
+    this.capabilities.isBackendStorageAPISupported = payload.isSupported;
+    this.logger.debug("Storage API support", { isSupported: payload.isSupported });
+    this.checkCapabilitiesComplete();
+  }
+  handleXHRSupport(payload) {
+    this.capabilities.isSynchronousXHRSupported = payload.isSupported;
+    this.logger.debug("Synchronous XHR support", { isSupported: payload.isSupported });
+    this.checkCapabilitiesComplete();
+  }
+  handleRendererInterfaces(payload) {
+    this.logger.debug("Renderer interfaces received", { count: payload.rendererInterfaces?.length ?? 0 });
+    if (payload.rendererInterfaces) {
+      for (const iface of payload.rendererInterfaces) {
+        const renderer = this.renderers.get(iface.id);
+        if (renderer) {
+          renderer.version = iface.version;
+          renderer.packageName = iface.renderer;
+        }
+        const versionNum = parseFloat(iface.version);
+        if (versionNum >= 18) {
+          this.capabilities.supportsProfilingChangeDescriptions = true;
+          this.capabilities.supportsTimeline = true;
+          this.capabilities.supportsErrorBoundaryTesting = true;
+        }
+      }
+    }
+    this.checkCapabilitiesComplete();
+  }
+  checkCapabilitiesComplete() {
+    if (!this.capabilitiesNegotiated) {
+      this.capabilitiesNegotiated = true;
+      this.logger.info("Protocol capabilities negotiated", { capabilities: this.capabilities });
+      this.emit("capabilitiesNegotiated", this.capabilities);
+    }
+  }
+  handleAttributeSourceResult(payload) {
+    this.resolveCorrelatedRequest("attributeSource", payload, payload.source);
+    if (payload.source) {
+      this.emit("attributeSource", payload.source);
+    }
+  }
+  handleInspectingNativeStopped(payload) {
+    this.logger.info("Native inspection stopped", { elementID: payload.elementID });
+    this.resolvePending("inspectNative", payload.elementID);
+    this.emit("inspectingNativeStopped", payload.elementID);
+  }
+  handleNativeStyleResponse(payload) {
+    this.resolveCorrelatedRequest("nativeStyle", payload, { style: payload.style, layout: payload.layout });
+  }
+  handleClipboardResponse(payload) {
+    if (payload.responseID !== void 0) {
+      this.resolvePending(`clipboard_${payload.responseID}`, { success: true });
+    } else {
+      for (const pendingKey of this.pendingRequests.keys()) {
+        if (pendingKey.startsWith("clipboard_")) {
+          this.resolvePending(pendingKey, { success: true });
+          break;
+        }
+      }
+    }
+  }
+  handleOverrideContextResponse(payload) {
+    this.resolveCorrelatedRequest("overrideContext", payload, payload);
+  }
+  handleScreenshotResponse(payload) {
+    this.resolveCorrelatedRequest("screenshot", payload, payload);
   }
   // ═══════════════════════════════════════════════════════════════════════════
   // OPERATIONS PARSING (Phase 1.4: Bounds Checking)
   // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Decode UTF-8 string from operations array
+   * Based on react-devtools-shared/src/utils.js utfDecodeStringWithRanges
+   */
+  utfDecodeString(operations, start, end) {
+    let result = "";
+    for (let i = start; i <= end; i++) {
+      const charCode = operations[i];
+      if (typeof charCode === "number" && charCode >= 0 && charCode <= 1114111) {
+        result += String.fromCodePoint(charCode);
+      }
+    }
+    return result;
+  }
   handleOperations(operations) {
     if (!Array.isArray(operations)) {
       this.logger.warn("Invalid operations: not an array");
       return;
     }
-    if (operations.length < 2) {
+    if (operations.length < 3) {
       this.logger.debug("Empty operations array");
       return;
     }
     const rendererID = operations[0];
-    let i = 1;
-    this.logger.debug("Processing operations", { rendererID, count: operations.length });
+    const rootID = operations[1];
+    if (rootID !== 0) {
+      this.rootIDs.add(rootID);
+    }
+    let i = 2;
+    const stringTableSize = operations[i];
+    i++;
+    const stringTable = [null];
+    const stringTableEnd = i + stringTableSize;
+    while (i < stringTableEnd && i < operations.length) {
+      const strLength = operations[i];
+      i++;
+      if (strLength > 0 && i + strLength - 1 < operations.length) {
+        const str = this.utfDecodeString(operations, i, i + strLength - 1);
+        stringTable.push(str);
+        i += strLength;
+      } else {
+        stringTable.push("");
+      }
+    }
+    this.logger.debug("Parsed string table", {
+      rendererID,
+      rootID,
+      stringCount: stringTable.length - 1,
+      strings: stringTable.slice(1),
+      operationsStart: i
+    });
     while (i < operations.length) {
       const op = operations[i];
       if (typeof op !== "number") {
@@ -543,7 +832,7 @@ var DevToolsBridge = class extends EventEmitter {
       }
       switch (op) {
         case TREE_OP.ADD:
-          i = this.processAddOperation(operations, i + 1, rendererID);
+          i = this.processAddOperation(operations, i + 1, rendererID, stringTable);
           break;
         case TREE_OP.REMOVE:
           i = this.processRemoveOperation(operations, i + 1);
@@ -569,67 +858,75 @@ var DevToolsBridge = class extends EventEmitter {
     this.emit("operationsComplete");
   }
   /**
-   * Process ADD operation with bounds checking (Phase 1.4)
+   * Process ADD operation with string table lookup
+   * Based on react-devtools-shared/src/devtools/store.js onBridgeOperations
+   *
+   * Root format: [id, type=11, isStrictModeCompliant, profilerFlags, supportsStrictMode, hasOwnerMetadata]
+   * Non-root format: [id, type, parentID, ownerID, displayNameStringID, keyStringID, namePropStringID]
    */
-  processAddOperation(ops, i, _rendererID) {
-    const minRequired = 5;
-    if (i + minRequired > ops.length) {
-      this.logger.warn("ADD operation: insufficient data", { index: i, available: ops.length - i, needed: minRequired });
+  processAddOperation(ops, i, rendererID, stringTable) {
+    if (i + 2 > ops.length) {
+      this.logger.warn("ADD operation: insufficient data for id/type", { index: i, available: ops.length - i });
       return ops.length;
     }
     const id = ops[i++];
     const type = ops[i++];
-    const parentID = ops[i++];
-    const ownerID = ops[i++];
-    const displayNameLength = ops[i++];
-    if (displayNameLength < 0 || displayNameLength > 1e4) {
-      this.logger.warn("ADD operation: invalid displayNameLength", { displayNameLength, id });
-      return ops.length;
-    }
-    if (i + displayNameLength > ops.length) {
-      this.logger.warn("ADD operation: displayName extends past array", {
-        needed: displayNameLength,
-        available: ops.length - i
-      });
-      return ops.length;
-    }
-    let displayName = "";
-    for (let j = 0; j < displayNameLength; j++) {
-      const charCode = ops[i++];
-      if (typeof charCode === "number" && charCode >= 0 && charCode <= 1114111) {
-        displayName += String.fromCharCode(charCode);
-      }
-    }
-    if (i >= ops.length) {
-      this.logger.warn("ADD operation: missing keyLength field", { id });
-      return ops.length;
-    }
-    const keyLength = ops[i++];
-    let key = null;
-    if (keyLength < 0 || keyLength > 1e4) {
-      this.logger.warn("ADD operation: invalid keyLength", { keyLength, id });
-      return ops.length;
-    }
-    if (keyLength > 0) {
-      if (i + keyLength > ops.length) {
-        this.logger.warn("ADD operation: key extends past array", {
-          needed: keyLength,
-          available: ops.length - i
-        });
+    if (type === 11) {
+      if (i + 4 > ops.length) {
+        this.logger.warn("ADD root: insufficient data", { index: i, available: ops.length - i, needed: 4 });
         return ops.length;
       }
-      key = "";
-      for (let j = 0; j < keyLength; j++) {
-        const charCode = ops[i++];
-        if (typeof charCode === "number" && charCode >= 0 && charCode <= 1114111) {
-          key += String.fromCharCode(charCode);
-        }
+      const isStrictModeCompliant = ops[i++] > 0;
+      const profilerFlags = ops[i++];
+      const supportsStrictMode = ops[i++] > 0;
+      const hasOwnerMetadata = ops[i++] > 0;
+      const element2 = {
+        id,
+        parentID: null,
+        displayName: "Root",
+        type: "root",
+        key: null,
+        depth: 0,
+        weight: 1,
+        ownerID: null,
+        hasChildren: false,
+        env: null,
+        hocDisplayNames: null
+      };
+      this.rootIDs.add(id);
+      this.elements.set(id, element2);
+      this.elementToRenderer.set(id, rendererID);
+      const renderer2 = this.renderers.get(rendererID);
+      if (renderer2) {
+        renderer2.rootIDs.add(id);
+        renderer2.elementIDs.add(id);
       }
+      this.logger.debug("Added root element", {
+        id,
+        rendererID,
+        isStrictModeCompliant,
+        profilerFlags,
+        supportsStrictMode,
+        hasOwnerMetadata
+      });
+      this.emit("elementAdded", element2);
+      return i;
     }
+    if (i + 5 > ops.length) {
+      this.logger.warn("ADD operation: insufficient data", { index: i, available: ops.length - i, needed: 5 });
+      return ops.length;
+    }
+    const parentID = ops[i++];
+    const ownerID = ops[i++];
+    const displayNameStringID = ops[i++];
+    const keyStringID = ops[i++];
+    i++;
+    const displayName = displayNameStringID > 0 && displayNameStringID < stringTable.length ? stringTable[displayNameStringID] ?? "Unknown" : "Unknown";
+    const key = keyStringID > 0 && keyStringID < stringTable.length ? stringTable[keyStringID] : null;
     const element = {
       id,
       parentID: parentID === 0 ? null : parentID,
-      displayName: displayName || "Unknown",
+      displayName,
       type: ELEMENT_TYPE_MAP[type] ?? "function",
       key,
       depth: 0,
@@ -646,10 +943,13 @@ var DevToolsBridge = class extends EventEmitter {
         parent.hasChildren = true;
       }
     }
-    if (element.type === "root") {
-      this.rootIDs.add(id);
-    }
     this.elements.set(id, element);
+    this.elementToRenderer.set(id, rendererID);
+    const renderer = this.renderers.get(rendererID);
+    if (renderer) {
+      renderer.elementIDs.add(id);
+    }
+    this.logger.debug("Added element", { id, displayName, type: element.type, parentID });
     this.emit("elementAdded", element);
     return i;
   }
@@ -674,6 +974,15 @@ var DevToolsBridge = class extends EventEmitter {
       const id = ops[i++];
       const element = this.elements.get(id);
       if (element) {
+        const rendererID = this.elementToRenderer.get(id);
+        if (rendererID !== void 0) {
+          const renderer = this.renderers.get(rendererID);
+          if (renderer) {
+            renderer.elementIDs.delete(id);
+            renderer.rootIDs.delete(id);
+          }
+          this.elementToRenderer.delete(id);
+        }
         this.elements.delete(id);
         this.rootIDs.delete(id);
         this.elementErrors.delete(id);
@@ -732,12 +1041,10 @@ var DevToolsBridge = class extends EventEmitter {
   // RESPONSE HANDLERS (Phase 1.6: ID Correlation)
   // ═══════════════════════════════════════════════════════════════════════════
   handleInspectedElement(payload) {
-    const key = payload.requestID !== void 0 ? `inspect_${payload.requestID}` : `inspect_${payload.id ?? "unknown"}`;
-    this.resolvePending(key, payload);
+    this.resolveCorrelatedRequest("inspect", payload, payload);
   }
   handleOwnersList(payload) {
-    const key = payload.requestID !== void 0 ? `owners_${payload.requestID}` : `owners_${payload.id}`;
-    this.resolvePending(key, payload.owners);
+    this.resolveCorrelatedRequest("owners", payload, payload.owners);
   }
   handleProfilingData(payload) {
     this.profilingData = payload;
@@ -811,10 +1118,12 @@ var DevToolsBridge = class extends EventEmitter {
     this.ensureConnected();
     const rendererID = this.getRendererIDForElement(id);
     if (rendererID === null) {
-      return { type: "not-found" };
+      return { type: "not-found", id };
     }
     const requestID = this.nextRequestId();
-    const promise = this.createPending(`inspect_${requestID}`, `inspectElement(${id})`);
+    const primaryKey = `inspect_${requestID}`;
+    const promise = this.createPending(primaryKey, `inspectElement(${id})`);
+    this.storeFallbackKey("inspect", requestID, id);
     this.send("inspectElement", {
       id,
       rendererID,
@@ -834,7 +1143,9 @@ var DevToolsBridge = class extends EventEmitter {
       return [];
     }
     const requestID = this.nextRequestId();
-    const promise = this.createPending(`owners_${requestID}`, `getOwnersList(${id})`);
+    const primaryKey = `owners_${requestID}`;
+    const promise = this.createPending(primaryKey, `getOwnersList(${id})`);
+    this.storeFallbackKey("owners", requestID, id);
     this.send("getOwnersList", { id, rendererID, requestID });
     return promise;
   }
@@ -993,8 +1304,11 @@ var DevToolsBridge = class extends EventEmitter {
     if (rendererID === null) {
       return { style: null, layout: null };
     }
-    const promise = this.createPending("nativeStyle", `getNativeStyle(${id})`);
-    this.send("NativeStyleEditor_measure", { id, rendererID });
+    const requestID = this.nextRequestId();
+    const primaryKey = `nativeStyle_${requestID}`;
+    const promise = this.createPending(primaryKey, `getNativeStyle(${id})`);
+    this.storeFallbackKey("nativeStyle", requestID, id);
+    this.send("NativeStyleEditor_measure", { id, rendererID, requestID });
     return promise;
   }
   setNativeStyle(id, property, value) {
@@ -1004,6 +1318,176 @@ var DevToolsBridge = class extends EventEmitter {
     this.send("NativeStyleEditor_setValue", { id, rendererID, name: property, value });
   }
   // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.1: ADDITIONAL PUBLIC API
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Save content to clipboard
+   */
+  async saveToClipboard(value) {
+    this.ensureConnected();
+    const requestID = this.nextRequestId();
+    const primaryKey = `clipboard_${requestID}`;
+    const promise = this.createPending(primaryKey, "saveToClipboard");
+    this.send("saveToClipboard", { value, requestID });
+    return Promise.race([
+      promise,
+      new Promise(
+        (resolve) => setTimeout(() => resolve({ success: true }), 500)
+      )
+    ]);
+  }
+  /**
+   * View attribute source location
+   */
+  async viewAttributeSource(id, path) {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return null;
+    const requestID = this.nextRequestId();
+    const primaryKey = `attributeSource_${requestID}`;
+    const promise = this.createPending(primaryKey, `viewAttributeSource(${id})`);
+    this.storeFallbackKey("attributeSource", requestID, id);
+    this.send("viewAttributeSource", { id, rendererID, path, requestID });
+    return promise;
+  }
+  /**
+   * Override context value
+   */
+  async overrideContext(id, path, value) {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return false;
+    const requestID = this.nextRequestId();
+    const primaryKey = `overrideContext_${requestID}`;
+    const promise = this.createPending(primaryKey, `overrideContext(${id})`);
+    this.storeFallbackKey("overrideContext", requestID, id);
+    this.send("overrideContext", { id, rendererID, path, value, requestID });
+    try {
+      const result = await promise;
+      return result.success;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * Start native element inspection mode
+   */
+  startInspectingNative() {
+    this.ensureConnected();
+    this.send("startInspectingNative", {});
+  }
+  /**
+   * Stop native element inspection mode
+   * @param selectNextElement - Whether to select the next element under pointer
+   * @returns The ID of the selected element, or null
+   */
+  async stopInspectingNative(selectNextElement = true) {
+    this.ensureConnected();
+    const promise = this.createPending("inspectNative", "stopInspectingNative");
+    this.send("stopInspectingNative", { selectNextElement });
+    return promise;
+  }
+  /**
+   * Check if currently in native inspection mode
+   */
+  isInspectingNativeMode() {
+    return this.isInspectingNative;
+  }
+  /**
+   * Capture screenshot of an element
+   */
+  async captureScreenshot(id) {
+    this.ensureConnected();
+    const rendererID = this.getRendererIDForElement(id);
+    if (rendererID === null) return null;
+    const requestID = this.nextRequestId();
+    const primaryKey = `screenshot_${requestID}`;
+    const promise = this.createPending(primaryKey, `captureScreenshot(${id})`);
+    this.storeFallbackKey("screenshot", requestID, id);
+    this.send("captureScreenshot", { id, rendererID, requestID });
+    try {
+      const result = await promise;
+      return result.screenshot;
+    } catch {
+      return null;
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.2: CAPABILITIES API
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Get negotiated protocol capabilities
+   */
+  getCapabilities() {
+    return { ...this.capabilities };
+  }
+  /**
+   * Check if capabilities have been negotiated
+   */
+  hasNegotiatedCapabilities() {
+    return this.capabilitiesNegotiated;
+  }
+  /**
+   * Wait for capabilities negotiation to complete
+   */
+  async waitForCapabilities(timeout = 5e3) {
+    if (this.capabilitiesNegotiated) {
+      return this.getCapabilities();
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.removeListener("capabilitiesNegotiated", handler);
+        reject(new TimeoutError("waitForCapabilities", timeout));
+      }, timeout);
+      const handler = (capabilities) => {
+        clearTimeout(timer);
+        resolve(capabilities);
+      };
+      this.once("capabilitiesNegotiated", handler);
+    });
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2.3: RENDERER MANAGEMENT API
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Get all connected renderers
+   */
+  getRenderers() {
+    return Array.from(this.renderers.values()).map((r) => ({
+      ...r,
+      rootIDs: new Set(r.rootIDs),
+      elementIDs: new Set(r.elementIDs)
+    }));
+  }
+  /**
+   * Get renderer by ID
+   */
+  getRenderer(id) {
+    const renderer = this.renderers.get(id);
+    if (!renderer) return null;
+    return {
+      ...renderer,
+      rootIDs: new Set(renderer.rootIDs),
+      elementIDs: new Set(renderer.elementIDs)
+    };
+  }
+  /**
+   * Get renderer for a specific element
+   */
+  getRendererForElement(elementID) {
+    const rendererID = this.getRendererIDForElement(elementID);
+    if (rendererID === null) return null;
+    return this.getRenderer(rendererID);
+  }
+  /**
+   * Get elements for a specific renderer
+   */
+  getElementsByRenderer(rendererID) {
+    const renderer = this.renderers.get(rendererID);
+    if (!renderer) return [];
+    return Array.from(renderer.elementIDs).map((id) => this.elements.get(id)).filter((el) => el !== void 0);
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
   // HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
   ensureConnected() {
@@ -1011,7 +1495,22 @@ var DevToolsBridge = class extends EventEmitter {
       throw new ConnectionError("Not connected to DevTools");
     }
   }
-  getRendererIDForElement(_id) {
+  /**
+   * Get renderer ID for an element (Phase 2.3: Multi-renderer support)
+   */
+  getRendererIDForElement(id) {
+    if (!this.elements.has(id)) {
+      return null;
+    }
+    const rendererID = this.elementToRenderer.get(id);
+    if (rendererID !== void 0) {
+      return rendererID;
+    }
+    for (const renderer of this.renderers.values()) {
+      if (renderer.elementIDs.has(id) || renderer.rootIDs.has(id)) {
+        return renderer.id;
+      }
+    }
     if (this.renderers.size === 0) {
       return 1;
     }
@@ -1030,6 +1529,238 @@ var DevToolsBridge = class extends EventEmitter {
     return this.pendingRequests.size;
   }
 };
+
+// src/headless-server.ts
+import WebSocket2, { WebSocketServer } from "ws";
+import { createServer as createHttpServer } from "http";
+import { createServer as createHttpsServer } from "https";
+import { readFileSync } from "fs";
+import { createRequire } from "module";
+import { EventEmitter as EventEmitter2 } from "events";
+var require2 = createRequire(import.meta.url);
+var HeadlessDevToolsServer = class extends EventEmitter2 {
+  _options;
+  _httpServer = null;
+  _wsServer = null;
+  _socket = null;
+  _state;
+  _backendScript = null;
+  constructor(options = {}) {
+    super();
+    this._options = {
+      port: options.port ?? 8097,
+      host: options.host ?? "localhost",
+      httpsOptions: options.httpsOptions,
+      logger: options.logger ?? noopLogger
+    };
+    this._state = {
+      status: "stopped",
+      port: this._options.port,
+      host: this._options.host,
+      connectedAt: null,
+      error: null
+    };
+    this._loadBackendScript();
+  }
+  _loadBackendScript() {
+    try {
+      const backendPath = require2.resolve("react-devtools-core/dist/backend.js");
+      this._backendScript = readFileSync(backendPath, "utf-8");
+      this._options.logger.debug("Loaded backend.js from react-devtools-core");
+    } catch (err) {
+      this._options.logger.warn("Could not load backend.js - web apps will need to include it manually");
+    }
+  }
+  get state() {
+    return { ...this._state };
+  }
+  get isConnected() {
+    return this._socket !== null && this._socket.readyState === WebSocket2.OPEN;
+  }
+  // External message listeners (for MCP bridge integration)
+  _externalMessageListeners = [];
+  /**
+   * Add an external message listener that receives all messages from React app.
+   * Used to relay messages to the MCP's DevToolsBridge.
+   */
+  addMessageListener(fn) {
+    this._externalMessageListeners.push(fn);
+    return () => {
+      const idx = this._externalMessageListeners.indexOf(fn);
+      if (idx >= 0) this._externalMessageListeners.splice(idx, 1);
+    };
+  }
+  /**
+   * Send a message to the React app via WebSocket.
+   * Used by the MCP's DevToolsBridge to send messages.
+   */
+  sendMessage(event, payload) {
+    if (this._socket && this._socket.readyState === WebSocket2.OPEN) {
+      this._socket.send(JSON.stringify({ event, payload }));
+    }
+  }
+  /**
+   * Start the headless DevTools server
+   */
+  async start() {
+    if (this._state.status === "listening" || this._state.status === "connected") {
+      this._options.logger.debug("Server already running");
+      return;
+    }
+    this._setState({ status: "starting", error: null });
+    const { port, host, httpsOptions } = this._options;
+    const logger = this._options.logger;
+    return new Promise((resolve, reject) => {
+      try {
+        this._httpServer = httpsOptions ? createHttpsServer(httpsOptions) : createHttpServer();
+        this._httpServer.on("request", (req, res) => {
+          this._handleHttpRequest(req, res);
+        });
+        this._wsServer = new WebSocketServer({
+          server: this._httpServer,
+          maxPayload: 1e9
+          // 1GB - same as standalone.js
+        });
+        this._wsServer.on("connection", (socket) => {
+          this._handleConnection(socket);
+        });
+        this._wsServer.on("error", (err) => {
+          logger.error("WebSocket server error", { error: err.message });
+          this._setState({ status: "error", error: err.message });
+          this.emit("error", err);
+        });
+        this._httpServer.on("error", (err) => {
+          logger.error("HTTP server error", { error: err.message, code: err.code });
+          if (err.code === "EADDRINUSE") {
+            this._setState({
+              status: "error",
+              error: `Port ${port} is already in use. Another DevTools instance may be running.`
+            });
+          } else {
+            this._setState({ status: "error", error: err.message });
+          }
+          this.emit("error", err);
+          reject(err);
+        });
+        this._httpServer.listen(port, host, () => {
+          logger.info("Headless DevTools server listening", { port, host });
+          this._setState({ status: "listening" });
+          this.emit("listening", { port, host });
+          resolve();
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unknown error";
+        logger.error("Failed to start server", { error: message });
+        this._setState({ status: "error", error: message });
+        reject(err);
+      }
+    });
+  }
+  /**
+   * Stop the server
+   */
+  async stop() {
+    const logger = this._options.logger;
+    logger.info("Stopping headless DevTools server");
+    if (this._socket) {
+      this._socket.close();
+      this._socket = null;
+    }
+    if (this._wsServer) {
+      this._wsServer.close();
+      this._wsServer = null;
+    }
+    if (this._httpServer) {
+      this._httpServer.close();
+      this._httpServer = null;
+    }
+    this._setState({
+      status: "stopped",
+      connectedAt: null,
+      error: null
+    });
+    this.emit("stopped");
+  }
+  /**
+   * Handle HTTP requests - serve backend.js for web apps
+   */
+  _handleHttpRequest(_req, res) {
+    const { port, host, httpsOptions, logger } = this._options;
+    const useHttps = !!httpsOptions;
+    if (!this._backendScript) {
+      logger.warn("Backend script not available");
+      res.writeHead(503);
+      res.end("Backend script not available. Web apps need to include react-devtools backend manually.");
+      return;
+    }
+    logger.debug("Serving backend.js to web client");
+    const responseScript = `${this._backendScript}
+;ReactDevToolsBackend.initialize();
+ReactDevToolsBackend.connectToDevTools({port: ${port}, host: '${host}', useHttps: ${useHttps}});
+`;
+    res.end(responseScript);
+  }
+  /**
+   * Handle new WebSocket connection from React app
+   */
+  _handleConnection(socket) {
+    const logger = this._options.logger;
+    if (this._socket !== null) {
+      logger.warn("Only one connection allowed at a time. Closing previous connection.");
+      this._socket.close();
+    }
+    logger.info("React app connected");
+    this._socket = socket;
+    socket.on("message", (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        logger.debug("Received message", { event: message.event });
+        this._externalMessageListeners.forEach((fn) => {
+          try {
+            fn(message.event, message.payload);
+          } catch (err) {
+            logger.error("Error in external message listener", { error: err instanceof Error ? err.message : "Unknown" });
+          }
+        });
+      } catch (err) {
+        logger.error("Failed to parse message", { data: data.toString().slice(0, 100) });
+      }
+    });
+    socket.on("close", () => {
+      logger.info("React app disconnected");
+      this._onDisconnected();
+    });
+    socket.on("error", (err) => {
+      logger.error("WebSocket connection error", { error: err.message });
+      this._onDisconnected();
+    });
+    this._setState({
+      status: "connected",
+      connectedAt: Date.now()
+    });
+    this.emit("connected");
+  }
+  /**
+   * Handle disconnection
+   */
+  _onDisconnected() {
+    this._socket = null;
+    this._setState({
+      status: "listening",
+      connectedAt: null
+    });
+    this.emit("disconnected");
+  }
+  _setState(updates) {
+    this._state = { ...this._state, ...updates };
+    this.emit("stateChange", this._state);
+  }
+};
+async function startHeadlessServer(options = {}) {
+  const server = new HeadlessDevToolsServer(options);
+  await server.start();
+  return server;
+}
 
 // src/server.ts
 var TOOLS = [
@@ -1449,6 +2180,99 @@ var TOOLS = [
     name: "health_check",
     description: "Get server and connection health status",
     inputSchema: { type: "object", properties: {} }
+  },
+  // Phase 2: Protocol & Renderer Management
+  {
+    name: "get_capabilities",
+    description: "Get negotiated protocol capabilities (features supported by backend)",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "get_renderers",
+    description: "Get all connected React renderers (for multi-renderer apps)",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "get_renderer",
+    description: "Get a specific renderer by ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Renderer ID" }
+      },
+      required: ["id"]
+    }
+  },
+  {
+    name: "get_elements_by_renderer",
+    description: "Get all elements for a specific renderer",
+    inputSchema: {
+      type: "object",
+      properties: {
+        rendererID: { type: "number", description: "Renderer ID" }
+      },
+      required: ["rendererID"]
+    }
+  },
+  // Phase 2: Native Inspection
+  {
+    name: "start_inspecting_native",
+    description: "Start native element inspection mode (tap-to-select)",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "stop_inspecting_native",
+    description: "Stop native element inspection mode",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selectNextElement: { type: "boolean", description: "Select element under pointer (default: true)" }
+      }
+    }
+  },
+  {
+    name: "get_inspecting_native_status",
+    description: "Check if native inspection mode is active",
+    inputSchema: { type: "object", properties: {} }
+  },
+  // Phase 2: Additional Features
+  {
+    name: "capture_screenshot",
+    description: "Capture screenshot of an element (if supported)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Element ID" }
+      },
+      required: ["id"]
+    }
+  },
+  {
+    name: "save_to_clipboard",
+    description: "Save content to system clipboard",
+    inputSchema: {
+      type: "object",
+      properties: {
+        value: { type: "string", description: "Content to save" }
+      },
+      required: ["value"]
+    }
+  },
+  {
+    name: "view_attribute_source",
+    description: "Get source location for a specific attribute path",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Element ID" },
+        path: {
+          type: "array",
+          items: { oneOf: [{ type: "string" }, { type: "number" }] },
+          description: "Path to attribute"
+        }
+      },
+      required: ["id", "path"]
+    }
   }
 ];
 function createServer(options = {}) {
@@ -1456,9 +2280,13 @@ function createServer(options = {}) {
     level: getLogLevelFromEnv(),
     prefix: "devtools-mcp"
   });
+  const host = options.host ?? process.env.DEVTOOLS_HOST ?? "localhost";
+  const port = options.port ?? (Number(process.env.DEVTOOLS_PORT) || 8097);
+  const standalone = options.standalone ?? process.env.DEVTOOLS_STANDALONE !== "false";
+  let headlessServer = null;
   const bridge = new DevToolsBridge({
-    host: options.host ?? process.env.DEVTOOLS_HOST ?? "localhost",
-    port: options.port ?? (Number(process.env.DEVTOOLS_PORT) || 8097),
+    host,
+    port,
     timeout: Number(process.env.DEVTOOLS_TIMEOUT) || 5e3,
     logger: logger.child("bridge")
   });
@@ -1549,15 +2377,64 @@ function createServer(options = {}) {
   return {
     server,
     bridge,
+    headlessServer: () => headlessServer,
     async start() {
+      if (standalone) {
+        try {
+          logger.info("Starting standalone mode with embedded DevTools server", { host, port });
+          headlessServer = await startHeadlessServer({
+            host,
+            port,
+            logger: logger.child("headless")
+          });
+          let bridgeHandle = null;
+          headlessServer.addMessageListener((event, payload) => {
+            if (bridgeHandle) {
+              const data = JSON.stringify({ event, payload });
+              bridgeHandle.receiveMessage(data);
+            } else {
+              logger.debug("Message received before bridge attached", { event });
+            }
+          });
+          headlessServer.on("connected", () => {
+            logger.info("React app connected to embedded DevTools server");
+            bridgeHandle = bridge.attachToExternal(
+              (event, payload) => {
+                headlessServer.sendMessage(event, payload);
+              },
+              () => {
+                logger.info("MCP bridge detached from headless server");
+              }
+            );
+          });
+          headlessServer.on("disconnected", () => {
+            logger.info("React app disconnected from embedded DevTools server");
+            bridgeHandle?.detach();
+            bridgeHandle = null;
+          });
+          headlessServer.on("error", (err) => {
+            logger.error("Embedded DevTools server error", { error: err.message });
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown error";
+          logger.error("Failed to start embedded DevTools server", { error: message });
+        }
+      }
       const transport = new StdioServerTransport();
       await server.connect(transport);
-      if (autoConnect) {
+      if (autoConnect && !standalone) {
         try {
           await bridge.connect();
         } catch {
         }
       }
+    },
+    async stop() {
+      if (headlessServer) {
+        await headlessServer.stop();
+        headlessServer = null;
+      }
+      bridge.disconnect();
     }
   };
 }
@@ -1803,6 +2680,72 @@ async function handleToolCall(bridge, name, args) {
         pendingRequests,
         uptime: process.uptime()
       };
+    }
+    // Phase 2: Protocol & Renderer Management
+    case "get_capabilities": {
+      const capabilities = bridge.getCapabilities();
+      const negotiated = bridge.hasNegotiatedCapabilities();
+      return { capabilities, negotiated };
+    }
+    case "get_renderers": {
+      const renderers = bridge.getRenderers();
+      return {
+        renderers: renderers.map((r) => ({
+          id: r.id,
+          version: r.version,
+          packageName: r.packageName,
+          rootCount: r.rootIDs.size,
+          elementCount: r.elementIDs.size
+        }))
+      };
+    }
+    case "get_renderer": {
+      const renderer = bridge.getRenderer(args.id);
+      if (!renderer) {
+        return { renderer: null };
+      }
+      return {
+        renderer: {
+          id: renderer.id,
+          version: renderer.version,
+          packageName: renderer.packageName,
+          rootIDs: Array.from(renderer.rootIDs),
+          elementCount: renderer.elementIDs.size
+        }
+      };
+    }
+    case "get_elements_by_renderer": {
+      const elements = bridge.getElementsByRenderer(args.rendererID);
+      return { elements, count: elements.length };
+    }
+    // Phase 2: Native Inspection
+    case "start_inspecting_native": {
+      bridge.startInspectingNative();
+      return { success: true, isInspecting: true };
+    }
+    case "stop_inspecting_native": {
+      const selectNextElement = args.selectNextElement !== false;
+      const elementID = await bridge.stopInspectingNative(selectNextElement);
+      return { success: true, selectedElementID: elementID };
+    }
+    case "get_inspecting_native_status": {
+      return { isInspecting: bridge.isInspectingNativeMode() };
+    }
+    // Phase 2: Additional Features
+    case "capture_screenshot": {
+      const screenshot = await bridge.captureScreenshot(args.id);
+      return { success: screenshot !== null, screenshot };
+    }
+    case "save_to_clipboard": {
+      const clipResult = await bridge.saveToClipboard(args.value);
+      return clipResult;
+    }
+    case "view_attribute_source": {
+      const source = await bridge.viewAttributeSource(
+        args.id,
+        args.path
+      );
+      return { source };
     }
     default:
       throw new Error(`Unknown tool: ${name}`);

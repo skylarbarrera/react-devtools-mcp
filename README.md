@@ -1,4 +1,4 @@
-# react-devtools-mcp
+# react-devtools-bridge
 
 Give AI agents eyes into your React app.
 
@@ -12,7 +12,7 @@ Give AI agents eyes into your React app.
   "mcpServers": {
     "react-devtools": {
       "command": "npx",
-      "args": ["react-devtools-mcp"]
+      "args": ["react-devtools-bridge"]
     }
   }
 }
@@ -37,7 +37,7 @@ npx add-skill skylarbarrera/react-devtools-mcp
 
 Or manually:
 ```bash
-cp node_modules/react-devtools-mcp/SKILL.md ~/.claude/skills/react-devtools/SKILL.md
+cp node_modules/react-devtools-bridge/SKILL.md ~/.claude/skills/react-devtools/SKILL.md
 ```
 
 ## Usage

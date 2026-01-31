@@ -13,6 +13,25 @@ interface ConnectionConfig {
     timeout: number;
     autoReconnect: boolean;
 }
+interface ProtocolCapabilities {
+    bridgeProtocolVersion: number;
+    backendVersion: string | null;
+    supportsInspectElementPaths: boolean;
+    supportsProfilingChangeDescriptions: boolean;
+    supportsTimeline: boolean;
+    supportsNativeStyleEditor: boolean;
+    supportsErrorBoundaryTesting: boolean;
+    supportsTraceUpdates: boolean;
+    isBackendStorageAPISupported: boolean;
+    isSynchronousXHRSupported: boolean;
+}
+interface Renderer {
+    id: number;
+    version: string;
+    packageName: string;
+    rootIDs: Set<number>;
+    elementIDs: Set<number>;
+}
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 interface ConnectionStatus {
     state: ConnectionState;
@@ -72,19 +91,38 @@ interface InspectedElement {
     rendererVersion: string | null;
     nativeTag: number | null;
 }
+/**
+ * InspectElementPayload - Response from backend for element inspection.
+ *
+ * Official React DevTools protocol includes:
+ * - `id`: The element ID being inspected
+ * - `responseID`: Echoes back the requestID from the request (used for correlation)
+ *
+ * Note: Some backends may omit responseID, so we handle fallback to element id.
+ */
 type InspectElementPayload = {
     type: 'full-data';
+    id: number;
+    responseID?: number;
     element: InspectedElement;
 } | {
     type: 'hydrated-path';
+    id: number;
+    responseID?: number;
     path: Array<string | number>;
     value: unknown;
 } | {
     type: 'no-change';
+    id: number;
+    responseID?: number;
 } | {
     type: 'not-found';
+    id: number;
+    responseID?: number;
 } | {
     type: 'error';
+    id: number;
+    responseID?: number;
     errorType: string;
     message: string;
     stack?: string;
@@ -270,8 +308,43 @@ type BridgeOutgoing = {
     id: number;
     property: string;
     value: unknown;
+} | {
+    type: 'isBackendStorageAPISupported';
+} | {
+    type: 'isSynchronousXHRSupported';
+} | {
+    type: 'getSupportedRendererInterfaces';
+} | {
+    type: 'saveToClipboard';
+    value: string;
+} | {
+    type: 'viewAttributeSource';
+    id: number;
+    rendererID: number;
+    path: Array<string | number>;
+} | {
+    type: 'overrideContext';
+    id: number;
+    rendererID: number;
+    path: Array<string | number>;
+    value: unknown;
+} | {
+    type: 'startInspectingNative';
+} | {
+    type: 'stopInspectingNative';
+    selectNextElement: boolean;
+} | {
+    type: 'captureScreenshot';
+    id: number;
+    rendererID: number;
 };
 type OverrideTarget = 'props' | 'state' | 'hooks' | 'context';
+/**
+ * BridgeIncoming - Messages from React DevTools backend.
+ *
+ * Response correlation: Official protocol uses `responseID` to echo back the `requestID`.
+ * We support both `responseID` (official) and fallback to element `id` for compatibility.
+ */
 type BridgeIncoming = {
     type: 'inspectedElement';
     payload: InspectElementPayload;
@@ -280,6 +353,8 @@ type BridgeIncoming = {
     operations: number[];
 } | {
     type: 'ownersList';
+    id: number;
+    responseID?: number;
     owners: SerializedElement[];
 } | {
     type: 'profilingData';
@@ -295,6 +370,8 @@ type BridgeIncoming = {
     version: number;
 } | {
     type: 'NativeStyleEditor_styleAndLayout';
+    id: number;
+    responseID?: number;
     style: Record<string, unknown>;
     layout: {
         x: number;
@@ -302,7 +379,49 @@ type BridgeIncoming = {
         width: number;
         height: number;
     };
+} | {
+    type: 'isBackendStorageAPISupported';
+    isSupported: boolean;
+} | {
+    type: 'isSynchronousXHRSupported';
+    isSupported: boolean;
+} | {
+    type: 'getSupportedRendererInterfaces';
+    rendererInterfaces: RendererInterface[];
+} | {
+    type: 'updateComponentFilters';
+} | {
+    type: 'savedToClipboard';
+    responseID?: number;
+} | {
+    type: 'viewAttributeSourceResult';
+    id: number;
+    responseID?: number;
+    source: SourceLocation | null;
+} | {
+    type: 'overrideContextResult';
+    id: number;
+    responseID?: number;
+    success: boolean;
+} | {
+    type: 'inspectingNativeStarted';
+} | {
+    type: 'inspectingNativeStopped';
+    elementID: number | null;
+} | {
+    type: 'captureScreenshotResult';
+    id: number;
+    responseID?: number;
+    screenshot: string | null;
 };
+interface RendererInterface {
+    id: number;
+    renderer: string;
+    version: string;
+    bundleType: 'development' | 'production';
+    hasOwnerMetadata: boolean;
+    hasManyWarnings: boolean;
+}
 interface ConnectParams {
     host?: string;
     port?: number;
@@ -504,16 +623,49 @@ declare class DevToolsBridge extends EventEmitter {
     private elements;
     private rootIDs;
     private renderers;
+    private elementToRenderer;
     private pendingRequests;
     private requestIdCounter;
     private staleRequestCleanupTimer;
+    /**
+     * Unified fallback key mapping for request/response correlation.
+     * Maps element-based keys to requestID-based keys.
+     *
+     * Flow:
+     * 1. Request sent with requestID=123 for elementID=456
+     * 2. Store mapping: "inspect_456" -> "inspect_123"
+     * 3. Response arrives with responseID=123 OR just id=456
+     * 4. Try "inspect_123" first, fall back to mapping["inspect_456"]
+     * 5. Clean up mapping after resolving
+     *
+     * Needed because some React DevTools backends don't echo responseID reliably.
+     */
+    private responseFallbackKeys;
     private elementErrors;
     private elementWarnings;
     private isProfiling;
     private profilingData;
     private backendVersion;
+    private capabilities;
+    private capabilitiesNegotiated;
     private lastMessageAt;
+    private isInspectingNative;
+    private externalSendFn;
+    private isExternallyAttached;
     constructor(options?: BridgeOptions);
+    /**
+     * Attach to an external message source (e.g., HeadlessDevToolsServer).
+     * When attached, the bridge receives messages from the external source
+     * instead of connecting via WebSocket.
+     */
+    attachToExternal(sendFn: (event: string, payload: unknown) => void, onDetach?: () => void): {
+        receiveMessage: (data: string) => void;
+        detach: () => void;
+    };
+    /**
+     * Check if bridge is attached to an external source
+     */
+    isAttachedExternally(): boolean;
     /**
      * Connect to DevTools backend.
      * Handles deduplication of concurrent connect calls (Phase 1.2).
@@ -527,6 +679,10 @@ declare class DevToolsBridge extends EventEmitter {
      * Called when connection is established
      */
     private onConnected;
+    /**
+     * Negotiate protocol capabilities with backend (Phase 2.2)
+     */
+    private negotiateCapabilities;
     /**
      * Handle WebSocket close event
      */
@@ -563,6 +719,24 @@ declare class DevToolsBridge extends EventEmitter {
      */
     private resolvePending;
     /**
+     * Resolve a correlated request using responseID/requestID/fallback pattern.
+     * Handles the common pattern of: responseID -> requestID -> element ID fallback.
+     *
+     * @param prefix - Key prefix (e.g., 'inspect', 'owners', 'nativeStyle')
+     * @param payload - Response payload with optional responseID, requestID, and id
+     * @param result - Value to resolve the promise with
+     */
+    private resolveCorrelatedRequest;
+    /**
+     * Store a fallback key mapping for request correlation.
+     * Call this when sending a request that uses requestID.
+     *
+     * @param prefix - Key prefix (e.g., 'inspect', 'owners')
+     * @param requestID - The requestID being sent
+     * @param elementID - The element ID (used as fallback key)
+     */
+    private storeFallbackKey;
+    /**
      * Start periodic cleanup of stale requests (Phase 1.5)
      */
     private startStaleRequestCleanup;
@@ -573,9 +747,28 @@ declare class DevToolsBridge extends EventEmitter {
     private send;
     private handleMessage;
     private handleRenderer;
+    private handleStorageSupport;
+    private handleXHRSupport;
+    private handleRendererInterfaces;
+    private checkCapabilitiesComplete;
+    private handleAttributeSourceResult;
+    private handleInspectingNativeStopped;
+    private handleNativeStyleResponse;
+    private handleClipboardResponse;
+    private handleOverrideContextResponse;
+    private handleScreenshotResponse;
+    /**
+     * Decode UTF-8 string from operations array
+     * Based on react-devtools-shared/src/utils.js utfDecodeStringWithRanges
+     */
+    private utfDecodeString;
     private handleOperations;
     /**
-     * Process ADD operation with bounds checking (Phase 1.4)
+     * Process ADD operation with string table lookup
+     * Based on react-devtools-shared/src/devtools/store.js onBridgeOperations
+     *
+     * Root format: [id, type=11, isStrictModeCompliant, profilerFlags, supportsStrictMode, hasOwnerMetadata]
+     * Non-root format: [id, type, parentID, ownerID, displayNameStringID, keyStringID, namePropStringID]
      */
     private processAddOperation;
     /**
@@ -639,7 +832,70 @@ declare class DevToolsBridge extends EventEmitter {
         } | null;
     }>;
     setNativeStyle(id: number, property: string, value: unknown): void;
+    /**
+     * Save content to clipboard
+     */
+    saveToClipboard(value: string): Promise<{
+        success: boolean;
+    }>;
+    /**
+     * View attribute source location
+     */
+    viewAttributeSource(id: number, path: Array<string | number>): Promise<SourceLocation | null>;
+    /**
+     * Override context value
+     */
+    overrideContext(id: number, path: Array<string | number>, value: unknown): Promise<boolean>;
+    /**
+     * Start native element inspection mode
+     */
+    startInspectingNative(): void;
+    /**
+     * Stop native element inspection mode
+     * @param selectNextElement - Whether to select the next element under pointer
+     * @returns The ID of the selected element, or null
+     */
+    stopInspectingNative(selectNextElement?: boolean): Promise<number | null>;
+    /**
+     * Check if currently in native inspection mode
+     */
+    isInspectingNativeMode(): boolean;
+    /**
+     * Capture screenshot of an element
+     */
+    captureScreenshot(id: number): Promise<string | null>;
+    /**
+     * Get negotiated protocol capabilities
+     */
+    getCapabilities(): ProtocolCapabilities;
+    /**
+     * Check if capabilities have been negotiated
+     */
+    hasNegotiatedCapabilities(): boolean;
+    /**
+     * Wait for capabilities negotiation to complete
+     */
+    waitForCapabilities(timeout?: number): Promise<ProtocolCapabilities>;
+    /**
+     * Get all connected renderers
+     */
+    getRenderers(): Renderer[];
+    /**
+     * Get renderer by ID
+     */
+    getRenderer(id: number): Renderer | null;
+    /**
+     * Get renderer for a specific element
+     */
+    getRendererForElement(elementID: number): Renderer | null;
+    /**
+     * Get elements for a specific renderer
+     */
+    getElementsByRenderer(rendererID: number): Element[];
     private ensureConnected;
+    /**
+     * Get renderer ID for an element (Phase 2.3: Multi-renderer support)
+     */
     private getRendererIDForElement;
     /**
      * Get last message timestamp (for health monitoring)
@@ -652,6 +908,82 @@ declare class DevToolsBridge extends EventEmitter {
 }
 
 /**
+ * Headless React DevTools Server
+ *
+ * Embeds the DevTools server directly into the MCP package, allowing it to work
+ * without the Electron DevTools app. Supports both React Native and Web apps.
+ *
+ * Based on: react-devtools-core/src/standalone.js
+ * Key difference: No DOM/UI rendering - purely headless for MCP integration.
+ */
+
+interface HeadlessServerOptions {
+    port?: number;
+    host?: string;
+    httpsOptions?: {
+        key: string;
+        cert: string;
+    };
+    logger?: Logger;
+}
+type ServerStatus = 'stopped' | 'starting' | 'listening' | 'connected' | 'error';
+interface ServerState {
+    status: ServerStatus;
+    port: number;
+    host: string;
+    connectedAt: number | null;
+    error: string | null;
+}
+declare class HeadlessDevToolsServer extends EventEmitter {
+    private _options;
+    private _httpServer;
+    private _wsServer;
+    private _socket;
+    private _state;
+    private _backendScript;
+    constructor(options?: HeadlessServerOptions);
+    private _loadBackendScript;
+    get state(): ServerState;
+    get isConnected(): boolean;
+    private _externalMessageListeners;
+    /**
+     * Add an external message listener that receives all messages from React app.
+     * Used to relay messages to the MCP's DevToolsBridge.
+     */
+    addMessageListener(fn: (event: string, payload: unknown) => void): () => void;
+    /**
+     * Send a message to the React app via WebSocket.
+     * Used by the MCP's DevToolsBridge to send messages.
+     */
+    sendMessage(event: string, payload: unknown): void;
+    /**
+     * Start the headless DevTools server
+     */
+    start(): Promise<void>;
+    /**
+     * Stop the server
+     */
+    stop(): Promise<void>;
+    /**
+     * Handle HTTP requests - serve backend.js for web apps
+     */
+    private _handleHttpRequest;
+    /**
+     * Handle new WebSocket connection from React app
+     */
+    private _handleConnection;
+    /**
+     * Handle disconnection
+     */
+    private _onDisconnected;
+    private _setState;
+}
+/**
+ * Create and start a headless DevTools server
+ */
+declare function startHeadlessServer(options?: HeadlessServerOptions): Promise<HeadlessDevToolsServer>;
+
+/**
  * React DevTools MCP Server
  *
  * Exposes React DevTools functionality via Model Context Protocol.
@@ -662,6 +994,14 @@ interface ServerOptions {
     port?: number;
     autoConnect?: boolean;
     logger?: Logger;
+    /**
+     * Run in standalone mode with embedded DevTools server.
+     * When true, starts a headless WebSocket server that React apps can connect to directly.
+     * No need for external `npx react-devtools` - works fully standalone.
+     *
+     * Default: true (can be disabled via DEVTOOLS_STANDALONE=false env var)
+     */
+    standalone?: boolean;
 }
 declare function createServer(options?: ServerOptions): {
     server: Server<{
@@ -699,7 +1039,9 @@ declare function createServer(options?: ServerOptions): {
         } | undefined;
     }>;
     bridge: DevToolsBridge;
+    headlessServer: () => HeadlessDevToolsServer | null;
     start(): Promise<void>;
+    stop(): Promise<void>;
 };
 
 /**
@@ -754,4 +1096,4 @@ declare class NotEditableError extends DevToolsError {
     constructor(operation: string, elementId: number, details?: Record<string, unknown>);
 }
 
-export { type BridgeIncoming, type BridgeOptions, type BridgeOutgoing, type ChangeDescription, type CleanedValue, type CommitData, type ComponentFilter, type ConnectParams, type ConnectResult, type ConnectionConfig, ConnectionError, type ConnectionState, type ConnectionStatus, type DehydratedData, type DeletePathParams, DevToolsBridge, DevToolsError, type Element, ElementNotFoundError, type ElementType, type ErrorCode, type GetComponentTreeParams, type GetComponentTreeResult, type GetErrorsAndWarningsResult, type GetNativeStyleParams, type GetNativeStyleResult, type GetOwnersListParams, type GetOwnersListResult, type GetProfilingStatusResult, type HighlightElementParams, type HookInfo, type HookType, type HooksTree, type InspectElementParams, type InspectElementPayload, type InspectElementResult, type InspectedElement, type LogLevel, type LogToConsoleParams, type Logger, type MCPError, NotEditableError, type OverrideHooksParams, type OverrideParams, type OverrideResult, type OverrideTarget, type ProfilingData, type ProfilingDataForRoot, ProtocolError, type RenamePathParams, type RootTree, type ScrollToElementParams, type SearchComponentsParams, type SearchComponentsResult, type SerializedElement, type ServerOptions, type SetNativeStyleParams, type SourceLocation, type StartProfilingParams, type StartProfilingResult, type StopProfilingResult, type StoreAsGlobalParams, type SuspenseInfo, type TimelineData, type TimelineEvent, TimeoutError, type ToggleErrorParams, type ToggleSuspenseParams, ValidationError, createLogger, createServer, getLogLevelFromEnv, noopLogger };
+export { type BridgeIncoming, type BridgeOptions, type BridgeOutgoing, type ChangeDescription, type CleanedValue, type CommitData, type ComponentFilter, type ConnectParams, type ConnectResult, type ConnectionConfig, ConnectionError, type ConnectionState, type ConnectionStatus, type DehydratedData, type DeletePathParams, DevToolsBridge, DevToolsError, type Element, ElementNotFoundError, type ElementType, type ErrorCode, type GetComponentTreeParams, type GetComponentTreeResult, type GetErrorsAndWarningsResult, type GetNativeStyleParams, type GetNativeStyleResult, type GetOwnersListParams, type GetOwnersListResult, type GetProfilingStatusResult, HeadlessDevToolsServer, type HeadlessServerOptions, type HighlightElementParams, type HookInfo, type HookType, type HooksTree, type InspectElementParams, type InspectElementPayload, type InspectElementResult, type InspectedElement, type LogLevel, type LogToConsoleParams, type Logger, type MCPError, NotEditableError, type OverrideHooksParams, type OverrideParams, type OverrideResult, type OverrideTarget, type ProfilingData, type ProfilingDataForRoot, type ProtocolCapabilities, ProtocolError, type RenamePathParams, type Renderer, type RendererInterface, type RootTree, type ScrollToElementParams, type SearchComponentsParams, type SearchComponentsResult, type SerializedElement, type ServerOptions, type ServerState, type ServerStatus, type SetNativeStyleParams, type SourceLocation, type StartProfilingParams, type StartProfilingResult, type StopProfilingResult, type StoreAsGlobalParams, type SuspenseInfo, type TimelineData, type TimelineEvent, TimeoutError, type ToggleErrorParams, type ToggleSuspenseParams, ValidationError, createLogger, createServer, getLogLevelFromEnv, noopLogger, startHeadlessServer };
